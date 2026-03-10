@@ -1,4 +1,4 @@
-# computational working memory
+# sWiMm 🏊: a computational working memory simulation framework
 
 Perceptual as well internally-generated information is plentiful---being able to use all of this information is essential to optimal planning and decision-making. 
 Deciding what information is relevant, choosing to robustly maintain it, accessing it on demand, and overwriting existing information with new, potentially more 
@@ -17,5 +17,20 @@ a researcher may be interested in. These experimental conditions live in separat
 discerning results and analyzing data pleasantly organized. Furthermore, the software supports exposure and transfer-learning experiments using these same condition-based
 tags, allowing precise documentation of the entire training history of a computational model and subsequent experiments on pretrained models.
 
-The main module (`-m workingmem`), implemented with an entrypoint in `workingmem/__main__.py` does the orchestrating of loading/constructing datasets, training/evaluating models.
+The main module (`python -m workingmem`), implemented as an entrypoint in `workingmem/__main__.py` does the orchestrating, i.e., 
+loading/constructing datasets, training/evaluating models. However, much of the library's functionality exposed for programmatic use as well, and allows
+researchers to construct datasets in a custom manner, manage their own training-eval routines, and handle data management.
+Components of the library may be imported as so: `import workingmem`, or `from workingmem import LSTMModelWrapper`.
+
 To see the options, run `python -m workingmem -h`.
+
+## Getting started / Install
+**Using with Weights and Biases (recommended)**
+This framework is best used alongside Weights and Biases. In order to do so, you will have to create an account on the [W&B website](https://wandb.ai).
+There are many ways in which to do so, including using your GitHub login.
+
+**Installing UV**
+**sWiMm** uses [`uv`](https://atral.sh/uv) as its package- and environement-manager. `uv` makes painless the age-old task of managing dependencies
+in Python. In order to install the framework, you'll need to install `uv` on your system. This is fairly straightforward---visit the link from before.
+
+**Installing sWiMm**
