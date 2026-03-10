@@ -56,16 +56,16 @@ class ModelConfig:
     # model_class: str = "transformer"
 
     attn_only: bool = True
-    n_heads: int = 2
+    n_heads: int = 4
     n_ctx: int = 1205  # this should be set so that it is longer than the longest trial sequence length we expect to use with the model. i.e., 4 * seq_len + change. for 300, we need at least 1201.
-    d_head: int = 128
+    d_head: int = 256
     d_mlp: int = 0
-    d_vocab: int = -1  # vocab dim is determined by the tokenizer
+    d_vocab: typing.Union[int, None] = None  # vocab dim is determined by the tokenizer
 
     # type of positional embedding to use: "rotary", "standard", None
     # NOTE! passing None corresponds to NOPE (no positional embeddings) rather
     # than some default. use with caution!
-    positional_embedding_type: typing.Union[str, None] = None
+    positional_embedding_type: typing.Union[str, None] = "rotary"
 
     # @dataclasses.dataclass
     # class RNNConfig(ModelConfig):
@@ -75,7 +75,7 @@ class ModelConfig:
 @dataclasses.dataclass
 class TrainingConfig:
     freeze_embeddings: typing.Union[bool, None] = None
-    epochs: int = 60
+    epochs: int = 40
     optimizer: str = "adamw"
     learning_rate: float = 4e-4
     weight_decay: float = 0.0
