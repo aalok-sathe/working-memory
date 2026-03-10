@@ -1,4 +1,4 @@
-# sWiMm 🏊: a computational working memory simulation framework
+# sWM 🏊: computational simulation for working memory research
 
 Perceptual as well internally-generated information is plentiful---being able to use all of this information is essential to optimal planning and decision-making. 
 Deciding what information is relevant, choosing to robustly maintain it, accessing it on demand, and overwriting existing information with new, potentially more 
@@ -30,7 +30,7 @@ This framework is best used alongside Weights and Biases. In order to do so, you
 There are many ways in which to do so, including using your GitHub login.
 
 **Installing UV**
-**sWiMm** uses [`uv`](https://atral.sh/uv) as its package- and environement-manager. `uv` makes painless the age-old task of managing dependencies
+**sWM** uses [`uv`](https://atral.sh/uv) as its package- and environement-manager. `uv` makes painless the age-old task of managing dependencies
 in Python. In order to install the framework, you'll need to install `uv` on your system. This is fairly straightforward---visit the link from before.
 
 **Installing sWiMm**
