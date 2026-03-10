@@ -1,6 +1,0 @@
-dataset.td_prob: [0, 1]
-# dataset.td_prob: [0]
-# dataset.role_n_congruence: [0, .25, .5, .75, 1]
-dataset.role_n_congruence: [0, .3, .5, .7, .8, .9, .95, 1]
-dataset.n_back: [4]
-dataset.concurrent_reg: [4]
