@@ -1,0 +1,58 @@
+# an example of a config that contains 
+
+#### independent_variables
+# this section contains a list of dictionaries, each containing 
+#   key: [values]
+# pairs. 
+# any independent variables that co-vary are grouped into a single dictionary
+# whose values are the same length. a zip() over the values is used in the product
+# between the values.
+
+independent_variables:
+  - dataset.td_prob: [0, 1]
+  - dataset.role_n_congruence: [0]
+  - dataset.n_back: [2, 3]
+    dataset.concurrent_reg: [2, 3]
+  - model.model_class: ['rnn', 'lstm', 'transformer']
+
+#### conditional variables
+# this section contains conditional variables---they aren't used to define
+# conditions like above (the independent variables). rather, they are
+# looked-up based on matching index. 
+# we go sequentially through the list of conditional variables and iterate
+# over the index. for each key, value in the index we try to match the current
+# instance of parameter combinations of independent variables. if all the index
+# key-values match those in the independent variables, we offload the kwargs
+# therein. if at least one key-value in the index does not match the independent
+# variables, we keep looking.
+# the ordering of the index entries matters: the first match is the one that is
+# applied.  so, if you place an entry whose index has the sole key-value
+# "model.model_class: 'rnn'" at the beginning of the list, that is the only set
+# of kwargs that will apply *any time* the model_class is rnn, even if there is
+# a more specific n_back-conditioned learning_rate value further along. so,
+# place the most narrowly-scoped index entries at the top of the list and the
+# most general and widely-scoped index entries at the end. i.e., defaults, if any,
+# should go at the very end. 
+
+conditional_variables:
+  # transformer
+  - index:
+      model.model_class: 'transformer'
+    kwargs:
+      trainer.learning_rate: 2.2e-4
+  # rnn
+  - index:
+      model.model_class: 'rnn'
+    kwargs:
+      trainer.learning_rate: 2e-4
+  # lstm
+  - index:
+      model.model_class: 'lstm'
+      dataset.td_prob: 0
+    kwargs:
+      trainer.learning_rate: 1e-3
+  - index:
+      model.model_class: 'lstm'
+      dataset.td_prob: 1
+    kwargs:
+      trainer.learning_rate: 3e-4
