@@ -1,6 +1,7 @@
-# sWM 🏊: computational simulation for working memory research
+# `sWiMm` 🏊: simulation of working memory management in neural networks
 
-Perceptual as well internally-generated information is plentiful---being able to use all of this information is essential to optimal planning and decision-making. 
+## Introduction
+Perceptual as well organism-internal information is plentiful---being able to use all of this information is essential to optimal planning and decision-making. 
 Deciding what information is relevant, choosing to robustly maintain it, accessing it on demand, and overwriting existing information with new, potentially more 
 relevant information, are all ecologically-relevant demands that make intelligent behavior possible. 
 However, knowing what information is relevant in any given context is difficult and needs to be learned over developmental as well as evolutionary timescales.
@@ -22,7 +23,7 @@ loading/constructing datasets, training/evaluating models. However, much of the 
 researchers to construct datasets in a custom manner, manage their own training-eval routines, and handle data management.
 Components of the library may be imported as so: `import workingmem`, or `from workingmem import LSTMModelWrapper`.
 
-To see the options, run `python -m workingmem -h`.
+To exhaustively see the CLI options, run `python -m workingmem -h`.
 
 ## Getting started / Install
 **Using with Weights and Biases (recommended)**
@@ -34,3 +35,5 @@ There are many ways in which to do so, including using your GitHub login.
 in Python. In order to install the framework, you'll need to install `uv` on your system. This is fairly straightforward---visit the link from before.
 
 **Installing sWiMm**
+- `uv sync`: install the python virtual environment with all requisite packages (needed once)
+- `. ./.venv/bin/activate`: activate the virtual environment in the directory of the library (needed each time you log in to your compute node until you exit/log out)
