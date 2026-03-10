@@ -162,7 +162,7 @@ def main(config: MainConfig):
 
     # we need to explicitly set `d_vocab` if it isn't supplied via CLI, only if we're not
     # loading a model from disk
-    if config.model.d_vocab is None:
+    if not config.model.d_vocab:
         config.model.d_vocab = eval_dataset.vocab_size
 
     # if we're loading a pretrained model, check if an explicit model is passed, or a directory containing many models is
