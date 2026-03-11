@@ -25,7 +25,8 @@ jobs:
         with:
           python-version: '3.14'
       - run: pip install uv 
-
+      - run: uv sync --system
+      - run: uv pip install pdoc --system
       # ADJUST THIS: install all dependencies (including pdoc)
       - run: uv pip install -e . --system
       # ADJUST THIS: build your documentation into docs/.
