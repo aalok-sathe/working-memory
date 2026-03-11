@@ -18,22 +18,36 @@ a researcher may be interested in. These experimental conditions live in separat
 discerning results and analyzing data pleasantly organized. Furthermore, the software supports exposure and transfer-learning experiments using these same condition-based
 tags, allowing precise documentation of the entire training history of a computational model and subsequent experiments on pretrained models.
 
-The main module (`python -m workingmem`), implemented as an entrypoint in `workingmem/__main__.py` does the orchestrating, i.e., 
+The main module (`python -m workingmem`), implemented as an entrypoint in `workingmem/__main__.py`, does the orchestrating of running experiments, i.e., 
 loading/constructing datasets, training/evaluating models. However, much of the library's functionality exposed for programmatic use as well, and allows
 researchers to construct datasets in a custom manner, manage their own training-eval routines, and handle data management.
-Components of the library may be imported as so: `import workingmem`, or `from workingmem import LSTMModelWrapper`.
+
+**A typical experiment workflow looks like:**
+1. identify manipulations of interest (see what variations the library already supports using `python -m workingmem -h`).
+2. write/modify a config defining experimental conditions ([example](./configs/sample_conditional_config))
+    - configs follow an "independent variables" and "conditional variables" format---independent variables are enumerated as lists
+      that yield a cross-product over all possible combinations of their variation. "conditional variables" are typically hyperparameters
+      that need to be looked up dependent on the particular condition.  
+3. use `python -m workingmem --wandb.create_sweep` along with the flag `--wandb.from_config [path/to/config]` to define individual experimental conditions.
+  at this point, the library evaluates a cross-product over all possible conditions in your experiment and creates individual
+  W&B "sweeps" for each condition. this enables separate tracking of the progress of experiments in a web browser, as well as unique-ID-based
+  retrieval after the experiment finishes for clean, reproducible science.
+
+For programmatic use, components of the library can be imported in your program: `import workingmem`, or `from workingmem import LSTMModelWrapper, SIRDataset`.
 
 To exhaustively see the CLI options, run `python -m workingmem -h`.
 
 ## Getting started / Install
-**Using with Weights and Biases (recommended)**
-This framework is best used alongside Weights and Biases. In order to do so, you will have to create an account on the [W&B website](https://wandb.ai).
-There are many ways in which to do so, including using your GitHub login.
+1. Use with Weights and Biases (recommended)
 
-**Installing UV**
-**sWM** uses [`uv`](https://atral.sh/uv) as its package- and environement-manager. `uv` makes painless the age-old task of managing dependencies
-in Python. In order to install the framework, you'll need to install `uv` on your system. This is fairly straightforward---visit the link from before.
+   `sWiMm` is best used alongside Weights and Biases. In order to do so, you will have to create an account on the [W&B website](https://wandb.ai).
+    There are many ways in which to do so, including using your GitHub login.
+   
+1. Install `uv`
 
-**Installing sWiMm**
-- `uv sync`: install the python virtual environment with all requisite packages (needed once)
-- `. ./.venv/bin/activate`: activate the virtual environment in the directory of the library (needed each time you log in to your compute node until you exit/log out)
+    `sWiMm` uses [`uv`](https://atral.sh/uv) as its package- and environement-manager. `uv` makes painless the age-old task of managing dependencies
+    in Python. In order to install the framework, you'll need to install `uv` on your system. This is fairly straightforward---visit the link from before.
+
+1. Install `sWiMm` (this library)
+    - `uv sync`: install the python virtual environment with all requisite packages (needed once)
+    - `. ./.venv/bin/activate`: activate the virtual environment in the directory of the library (needed each time you log in to your compute node until you exit/log out)
