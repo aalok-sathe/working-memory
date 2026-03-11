@@ -31,6 +31,7 @@ jobs:
       - run: uv pip install -e . 
       # ADJUST THIS: build your documentation into docs/.
       # We use a custom build script for pdoc itself, ideally you just run `pdoc -o docs/ ...` here.
+      - run: . ./.venv/bin/activate
       - run: pdoc workingmem -o docs/ 
 
       - uses: actions/upload-pages-artifact@v4
