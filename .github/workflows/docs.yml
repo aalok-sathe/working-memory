@@ -9,11 +9,16 @@ on:
     # tags:
     #   - '*'
 
+
+
 # security: restrict permissions for CI jobs.
 permissions:
   contents: read
 
 jobs:
+  with:
+    env:
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
   # Build the documentation and upload the static HTML files as an artifact.
   build:
     runs-on: ubuntu-latest
@@ -32,6 +37,8 @@ jobs:
       # ADJUST THIS: build your documentation into docs/.
       # We use a custom build script for pdoc itself, ideally you just run `pdoc -o docs/ ...` here.
       - run: . ./.venv/bin/activate
+      - name: wandb login
+        run: uv run wandb login ${{ env.WANDB_API_KEY }}
       - run: uv run pdoc workingmem -o docs/ 
 
       - uses: actions/upload-pages-artifact@v4
