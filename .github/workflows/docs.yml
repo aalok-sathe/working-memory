@@ -25,10 +25,10 @@ jobs:
         with:
           python-version: '3.14'
       - run: pip install uv 
-      - run: uv sync --system
-      - run: uv pip install pdoc --system
+      - run: uv sync 
+      - run: uv pip install pdoc 
       # ADJUST THIS: install all dependencies (including pdoc)
-      - run: uv pip install -e . --system
+      - run: uv pip install -e . 
       # ADJUST THIS: build your documentation into docs/.
       # We use a custom build script for pdoc itself, ideally you just run `pdoc -o docs/ ...` here.
       - run: pdoc workingmem -o docs/ 
