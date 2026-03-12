@@ -43,11 +43,14 @@ To exhaustively see the CLI options, run `python -m workingmem -h`.
    `sWiMm` is best used alongside Weights and Biases. In order to do so, you will have to create an account on the [W&B website](https://wandb.ai).
     There are many ways in which to do so, including using your GitHub login.
    
-1. Install `uv`
+1. Install `uv` (recommended)
 
     `sWiMm` uses [`uv`](https://atral.sh/uv) as its package- and environement-manager. `uv` makes painless the age-old task of managing dependencies
     in Python. In order to install the framework, you'll need to install `uv` on your system. This is fairly straightforward---visit the link from before.
 
-1. Install `sWiMm` (this library)
-    - `uv sync`: install the python virtual environment with all requisite packages (needed once)
-    - `. ./.venv/bin/activate`: activate the virtual environment in the directory of the library (needed each time you log in to your compute node until you exit/log out)
+1. Install `sWiMm` 
+    - using `uv`:
+      - `uv sync`: install the python virtual environment with all requisite packages (needed once)
+      - `. ./.venv/bin/activate`: activate the virtual environment in the directory of the library (needed each time you log in to your compute node until you exit/log out)
+    - using `pip`:
+      - pip install .
