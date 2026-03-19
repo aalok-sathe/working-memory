@@ -46,12 +46,9 @@ def subset_data(
     properties = extract_sweep_properties(sweeps, list(index.keys()))
     # evaluate properties using index
     sweep_ids_to_keep = [
-        sweep_id
+        sweep["sweep_id"]
         for sweep in sweeps.values()
-        if all(
-            index[prop](properties[(sweep_id := sweep["sweep_id"])][prop])
-            for prop in index
-        )
+        if all(index[prop](properties[sweep["sweep_id"]][prop]) for prop in index)
     ]
     return gather_data(basedir, kind=kind, include=tuple(sorted(sweep_ids_to_keep)))
 
