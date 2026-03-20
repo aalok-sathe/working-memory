@@ -11,10 +11,9 @@
 independent_variables:
   - dataset.td_prob: [0, 1]
   - dataset.role_n_congruence: [0]
-  - dataset.n_back: [5]
-    dataset.concurrent_reg: [5]
+  - dataset.n_back: [4, 5]
+    dataset.concurrent_reg: [4, 5]
   - model.model_class: ['transformer']
-  - model.from_pretrained: ['model_checkpoints/e5gvjald', 'model_checkpoints/7c2bild8']
 
 #### conditional variables
 # this section contains conditional variables---they aren't used to define
@@ -36,14 +35,24 @@ independent_variables:
 # should go at the very end. 
 
 conditional_variables:
-### transformer
+  # transformer
   - index:
       model.model_class: 'transformer'
+    kwargs:
+      trainer.learning_rate: 2.2e-4
+  # rnn
+  - index:
+      model.model_class: 'rnn'
+    kwargs:
+      trainer.learning_rate: 2e-4
+  # lstm
+  - index:
+      model.model_class: 'lstm'
       dataset.td_prob: 0
     kwargs:
-      trainer.learning_rate: 2.2e-4
+      trainer.learning_rate: 1e-3
   - index:
-      model.model_class: 'transformer'
+      model.model_class: 'lstm'
       dataset.td_prob: 1
     kwargs:
-      trainer.learning_rate: 2.2e-4
+      trainer.learning_rate: 3e-4
