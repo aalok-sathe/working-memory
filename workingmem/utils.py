@@ -75,7 +75,7 @@ def _get_wandb_runs(
 
         try:
             dfs += [metrics]
-        except KeyError as e:
+        except KeyError:
             # this run doesn't have enough data to have 'epoch' as a key; skip for now
             print(
                 f"\tkey `epoch` not found. skipping run: https://wandb.ai/{prefix}/{project_name}/runs/{run.name}"
@@ -162,7 +162,7 @@ def parse_config(config) -> typing.Generator[dict, None, None]:
             # we iterate through conditoinal variable entries in order
             # and check if
             kwargs = {}
-            for cond_variable_set in conditional_variables:
+            for cond_variable_set in conditional_variables or []:
                 index = cond_variable_set["index"]
                 if all(parameters[k] == v for k, v in index.items()):
                     this_kwargs = cond_variable_set["kwargs"]

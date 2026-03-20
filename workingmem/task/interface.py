@@ -220,7 +220,8 @@ class GeneratedCachedDataset(ABC, torch.utils.data.Dataset):
                     "generate",
                     "create_dataset_and_exit",
                     # "local_split_set_control",
-                )  # NOTE! local split set control is here for now.
+                )
+                # and v is not None  # breaking change
             ]
         )
         H = sha1(attr_str.encode()).hexdigest()[: self._hash_length].upper()
@@ -344,3 +345,8 @@ class GeneratedCachedDataset(ABC, torch.utils.data.Dataset):
         instance = cls(config)
 
         return instance
+
+
+_T_dataset_or_collection_of_datasets = (
+    GeneratedCachedDataset | typing.List[GeneratedCachedDataset]
+)

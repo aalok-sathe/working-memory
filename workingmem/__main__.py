@@ -30,13 +30,44 @@ if __name__ == "__main__":
     # case 1 is we create a new sweep
     if config.wandb.create_sweep:
         sweep_config = dataclasses.asdict(config.wandb)
+        # Add default parameters for dataset, model, and trainer from CLI to sweep_config
+        default_params = {
+            **{
+                f"dataset.{key}": {
+                    "value": " ".join(map(str, value))
+                    if isinstance(value, list)
+                    else str(value)
+                }
+                for key, value in dataclasses.asdict(config.dataset).items()
+                if not isinstance(value, bool)
+            },
+            **{
+                f"model.{key}": {
+                    "value": " ".join(map(str, value))
+                    if isinstance(value, list)
+                    else str(value)
+                }
+                for key, value in dataclasses.asdict(config.model).items()
+                if not isinstance(value, bool)
+            },
+            **{
+                f"trainer.{key}": {
+                    "value": " ".join(map(str, value))
+                    if isinstance(value, list)
+                    else str(value)
+                }
+                for key, value in dataclasses.asdict(config.trainer).items()
+                if not isinstance(value, bool)
+            },
+        }
+        sweep_config.update({"parameters": default_params})
 
         ############
         # parameters to use when we want to optimize hyperparameters before fixing them for experimentation
         ############
         hparam_optimization_params = {
             # "model.n_heads": {"values": [2, 4, 6]},
-            "model.n_layers": {"values": [1, 2]},
+            "model.n_layers": {"values": [2]},
             "model.d_model": {"values": [64, 128, 256, 512]},
             "model.d_hidden": {"values": [64, 128, 256, 512]},
             # we use a smaller range of seeds just to make sure out hparams aren't overly seed-specific.
@@ -76,15 +107,11 @@ if __name__ == "__main__":
         )
 
         # additional default params to use for both a hparam sweep or regular experiments
-        sweep_config.update(
-            {
-                "parameters": {
-                    **which_params_to_use,  # use either hparam optimization or fixed params
-                    ################################
-                    # "filter_by_accuracy": {"value": "True"}, # only relevant when `from_pretrained` is provided
-                },
-            },
+        sweep_config["parameters"].update(
+            which_params_to_use  # use either hparam optimization or fixed params
         )
+
+        logger.info(f"defaults: {sweep_config['parameters']}")
 
         if config.wandb.from_config is not None:
             # read the YAML file

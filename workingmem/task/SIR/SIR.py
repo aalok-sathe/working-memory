@@ -37,7 +37,7 @@ class SIRConfig(GeneratedCachedDatasetConfig):
     """total number of items in vocab to draw from"""
     seq_len: int = 200
     """length of a trial sequence"""
-    concurrent_reg: int = 4
+    concurrent_reg: int | typing.List[int] = 4
     """number of registers to use concurrently within a trial. if this
         number is too high, we risk a simple heuristic solution such as: 
         simply check if an item has appeared in the prior history, when 
@@ -72,15 +72,15 @@ class SIRConfig(GeneratedCachedDatasetConfig):
     """temporal dependence probability: (X_N ~ Uniform[0,1]) the probability with which 
         the corrent ANS at the current trial depends on the item that occurred at a 
         previous trial N* trials ago
-        *another interpretation of N is f(N), where f(N) is ignore-trial-aware (TODO; NotImplemented)
+        *another interpretation of N is f(N), where f(N) is ignore-trial-aware 
         """
-    n_back: typing.Union[int, None] = None
+    n_back: int | typing.List[int] | None = None
     """specify N for n-back-i-ness. must be >= 1 when provided. 
         must be provided when temporal dependence (`td_prob`) > 0. 
         does nothing when `td_prob` = 0.
         should be = `concurrent_reg` for `role_n_congruence` to be an
         effective signal
-        *f(N), where f(N) is ignore-trial-aware (TODO; NotImplemented)
+        *f(N), where f(N) is ignore-trial-aware 
         """
     role_n_congruence: typing.Union[float, None] = 0.0
     """role-N congruence probability: (Y ~ Uniform[0,1])
@@ -231,6 +231,9 @@ class SIRDataset(GeneratedCachedDataset):
         # this is unfortunate; we won't be able to read into the heldout test set results for this round of expts.
         np.random.seed(config.seed or 42)
         random.seed(config.seed or 42)
+
+        if config.n_back is None and config.concurrent_reg is not None:
+            config.n_back = config.concurrent_reg
 
         super().__init__(config)
         self.tokenizer = tokenizer or SIRTokenizer.from_params(

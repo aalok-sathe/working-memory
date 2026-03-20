@@ -4,19 +4,23 @@ import typing
 from abc import ABC, abstractmethod
 from pathlib import Path
 import logging
+from itertools import chain
 import yaml
 
 # installed packages
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset, RandomSampler
 from tqdm.auto import tqdm
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 
 import wandb
 
 # local
-from workingmem.task.interface import GeneratedCachedDataset
+from workingmem.task.interface import (
+    GeneratedCachedDataset,
+    _T_dataset_or_collection_of_datasets,
+)
 from workingmem.model.interface import (
     AbstractPytorchModel,
     TrainingConfig,
@@ -34,8 +38,8 @@ logger.setLevel(logging.DEBUG)
 
 class ModelWrapper(ABC):
     """
-    this model wrapper treats the model as a first-class entity unlike in many training recipes in the field.
-    the model(wrapper) is now responsible to train itself, and to evaluate itself on a supplied dataset.
+    this model wrapper treats the model as a first-class entity.
+    the model(wrapper) is now responsible to train itself, and to evaluate itself on some supplied dataset.
     """
 
     model: AbstractPytorchModel
@@ -211,12 +215,87 @@ class ModelWrapper(ABC):
         """
         raise NotImplementedError
 
+    def _evaluate_and_log(
+        self,
+        datasets: typing.List[GeneratedCachedDataset],
+        log_prefix: str,
+        state: typing.Any,
+        training_config: TrainingConfig,
+        predictions_table: wandb.Table = None,
+        mask_answer_tokens: bool = True,
+    ) -> typing.Tuple[typing.List[dict], float, float, float]:
+        """
+        Helper method to evaluate and log metrics for a list of datasets.
+
+        Args:
+        ---
+        datasets: List[GeneratedCachedDataset]
+            List of datasets to evaluate.
+        log_prefix: str
+            Prefix for logging metrics (e.g., "eval" or "test").
+        state: TrainingState
+            Current training state.
+        training_config: TrainingConfig
+            Configuration for training.
+        predictions_table: wandb.Table (optional)
+            Table for logging predictions.
+        mask_answer_tokens: bool (default=True)
+            Whether to mask answer tokens during evaluation.
+
+        Returns:
+        ---
+        Tuple[float, float, float]
+            Average loss, accuracy, and macro accuracy across datasets.
+        """
+        metrics = []
+        for dataset in datasets:
+            result = self.evaluate(
+                dataset,
+                train_epoch=state.epoch,
+                predictions_table=predictions_table,
+                mask_answer_tokens=mask_answer_tokens,
+            )
+            metrics.append(
+                dict(
+                    **result,
+                    dataset=str(dataset),
+                )
+            )
+
+        avg_loss = np.mean([entry["loss"] for entry in metrics])
+        avg_acc = np.mean([entry["acc"] for entry in metrics])
+        avg_macro_acc = np.mean([entry["macro_acc"] for entry in metrics])
+
+        wandb.log(
+            {
+                **dataclasses.asdict(state),
+                "step": state.step,
+                f"{log_prefix}_loss": avg_loss,
+                f"{log_prefix}_acc": avg_acc,
+                f"{log_prefix}_macro_acc": avg_macro_acc,
+                **{
+                    f"{entry['dataset']}_{log_prefix}_acc": entry["acc"]
+                    for entry in metrics
+                },
+                **{
+                    f"{entry['dataset']}_{log_prefix}_loss": entry["loss"]
+                    for entry in metrics
+                },
+            }
+        )
+
+        logger.info(
+            f"{log_prefix.upper()}: {state.epoch = } {avg_loss = :.3f}, {avg_acc = :.3f}, {avg_macro_acc = :.3f}"
+        )
+
+        return metrics, avg_loss, avg_acc, avg_macro_acc
+
     def train(
         self,
-        dataset: GeneratedCachedDataset,
+        dataset: _T_dataset_or_collection_of_datasets,
         training_config: TrainingConfig,
-        eval_dataset: GeneratedCachedDataset = None,
-        test_dataset: GeneratedCachedDataset = None,
+        eval_dataset: _T_dataset_or_collection_of_datasets = None,
+        test_dataset: _T_dataset_or_collection_of_datasets = None,
     ):
         """
         given an `eval_dataset` and `test_dataset`, periodically evaluates model and logs the results
@@ -225,8 +304,14 @@ class ModelWrapper(ABC):
         # create an entry for history logging, which will be updated as we go
         self.history += [
             TrainingHistoryEntry(
-                dataset_name=repr(dataset),
-                dataset_path=str(dataset.config.basedir),
+                dataset_name=repr(
+                    dataset
+                ),  # repr should recursively call repr() on child datasets if a list is given
+                dataset_path=(
+                    str(dataset.config.basedir)
+                    if isinstance(dataset, GeneratedCachedDataset)
+                    else [str(d.config.basedir) for d in dataset]
+                ),
                 batch_size=training_config.batch_size,
                 learning_rate=training_config.learning_rate,
                 sparsity=training_config.sparsity,
@@ -237,19 +322,46 @@ class ModelWrapper(ABC):
                 run_url=(wandb.run.get_url() if wandb.run else None),
                 checkpoint_dir=None,  # to be filled in later
                 epoch=0,  # to be filled in later
-                eval_acc=None,  # to be filled in later
+                eval_acc=None,  # to be filled in later; will house the average acc across passed eval_dataset(s)
                 eval_macro_acc=None,  # to be filled in later
-                test_acc=None,  # to be filled in later
+                test_acc=None,  # to be filled in later; will house the average acc across passed eval_dataset(s)
                 test_macro_acc=None,  # to be filled in later
+                sub_metrics={},  # to be filled in later; will house either None or a list of child TrainingHistoryEntry objects per eval dataset
             )
         ]
 
-        train_dataloader = DataLoader(
-            dataset,
-            batch_size=training_config.batch_size,
-            shuffle=True,
-            num_workers=1,
-            pin_memory=True,
+        if isinstance(dataset, GeneratedCachedDataset):
+            dataloaders = [
+                DataLoader(
+                    dataset,
+                    batch_size=training_config.batch_size,
+                    shuffle=True,
+                    num_workers=1,
+                    pin_memory=True,
+                )
+            ]
+        else:
+            # Create a DataLoader for each dataset with RandomSampler
+            dataloaders = [
+                DataLoader(
+                    d,
+                    sampler=RandomSampler(d, num_samples=len(d) // len(dataset)),
+                    batch_size=training_config.batch_size,
+                    num_workers=1,
+                    pin_memory=True,
+                )
+                for d in dataset
+            ]
+
+        _len_train_dataset = (
+            sum(len(d) for d in dataset) if isinstance(dataset, list) else len(dataset)
+        )
+
+        eval_datasets = (
+            eval_dataset if isinstance(eval_dataset, list) else [eval_dataset]
+        )
+        test_datasets = (
+            test_dataset if isinstance(test_dataset, list) else [test_dataset]
         )
 
         @dataclasses.dataclass
@@ -276,7 +388,7 @@ class ModelWrapper(ABC):
             @property
             def step(self):
                 return self.epoch_step + np.ceil(
-                    self.epoch * len(dataset) / training_config.batch_size
+                    self.epoch * _len_train_dataset / training_config.batch_size
                 )
 
         if training_config.log_predictions:
@@ -329,6 +441,9 @@ class ModelWrapper(ABC):
 
             self.history[-1].epoch = state.epoch
 
+            # combine the dataloaders into a single iterable right before use so
+            # we can refresh the iterable each epoch
+            train_dataloader = chain.from_iterable(dataloaders)
             for state.epoch_step, inputs in enumerate(train_dataloader):
                 if state.best_val_acc >= 0.999:
                     logger.warning(
@@ -348,8 +463,6 @@ class ModelWrapper(ABC):
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
-                    # loss.backward()
-                    # optimizer.step()
                     optimizer.zero_grad()
 
                     wandb.log(
@@ -362,7 +475,7 @@ class ModelWrapper(ABC):
 
                 # evaluate the model when you reach the logging step within the epoch
                 log_every_steps = (
-                    len(dataset)
+                    _len_train_dataset
                     // training_config.batch_size
                     // training_config.logging_steps_per_epoch
                 )
@@ -372,46 +485,26 @@ class ModelWrapper(ABC):
                 ):
                     ################################
                     # eval loop mid-epoch at however-many logging steps
-                    eval_result = self.evaluate(
-                        eval_dataset,
-                        # we will not be passing the predictions table
-                        # to the eval loop; predictions will be logged at
-                        # the end of each epoch
-                        train_epoch=None,
-                        predictions_table=None,
-                        mask_answer_tokens=training_config.mask_answer_tokens,
+
+                    eval_metrics, eval_loss, eval_acc, eval_macro_acc = (
+                        self._evaluate_and_log(
+                            eval_datasets,
+                            log_prefix="eval",
+                            state=state,
+                            training_config=training_config,
+                            mask_answer_tokens=training_config.mask_answer_tokens,
+                        )
                     )
-                    eval_loss, eval_acc, eval_macro_acc = (
-                        eval_result["loss"],
-                        eval_result["acc"],
-                        eval_result["macro_acc"],
+                    test_metrics, test_loss, test_acc, test_macro_acc = (
+                        self._evaluate_and_log(
+                            test_datasets,
+                            log_prefix="test",
+                            state=state,
+                            training_config=training_config,
+                            mask_answer_tokens=training_config.mask_answer_tokens,
+                        )
                     )
-                    test_result = self.test(test_dataset, test_predictions_table=None)
-                    test_loss, test_acc, test_macro_acc = (
-                        test_result["loss"],
-                        test_result["acc"],
-                        test_result["macro_acc"],
-                    )
-                    # update latest known eval_acc
-                    self.history[-1].eval_acc = float(eval_acc)
-                    self.history[-1].test_acc = float(test_acc)
-                    self.history[-1].eval_macro_acc = float(eval_macro_acc)
-                    self.history[-1].test_macro_acc = float(eval_macro_acc)
-                    wandb.log(
-                        wandb_logged := {
-                            **dataclasses.asdict(state),
-                            "step": state.step,
-                            "eval_loss": eval_loss,
-                            "eval_acc": eval_acc,
-                            "eval_macro_acc": eval_macro_acc,
-                            "test_loss": test_loss,
-                            "test_acc": test_acc,
-                            "test_macro_acc": test_macro_acc,
-                        }
-                    )
-                    logger.info(
-                        f"------------- {state.epoch_step = } {eval_loss = :.3f}, {test_loss = :.3f},  {eval_acc = :.3f}, {test_acc = :.3f}"
-                    )
+
                     # end eval loop mid-epoch at however-many logging steps
                     ################################
                     self.model.train()
@@ -422,28 +515,32 @@ class ModelWrapper(ABC):
             ):
                 ################################
                 # eval once at the end of every epoch
-                eval_result = self.evaluate(
-                    eval_dataset,
-                    train_epoch=state.epoch,
-                    # passing the predictions table to the eval loop for
-                    # logging predictions and heatmaps over logits
-                    predictions_table=predictions_table,
-                    mask_answer_tokens=training_config.mask_answer_tokens,
+                eval_metrics, eval_loss, eval_acc, eval_macro_acc = (
+                    self._evaluate_and_log(
+                        eval_datasets,
+                        log_prefix="eval",
+                        state=state,
+                        training_config=training_config,
+                        predictions_table=predictions_table,
+                        mask_answer_tokens=training_config.mask_answer_tokens,
+                    )
                 )
-                eval_loss, eval_acc, eval_macro_acc = (
-                    eval_result["loss"],
-                    eval_result["acc"],
-                    eval_result["macro_acc"],
-                )
-                test_result = self.test(test_dataset, test_predictions_table=None)
-                test_loss, test_acc, test_macro_acc = (
-                    test_result["loss"],
-                    test_result["acc"],
-                    test_result["macro_acc"],
+                test_metrics, test_loss, test_acc, test_macro_acc = (
+                    self._evaluate_and_log(
+                        test_datasets,
+                        log_prefix="test",
+                        state=state,
+                        training_config=training_config,
+                        mask_answer_tokens=training_config.mask_answer_tokens,
+                    )
                 )
                 # update latest known eval_acc
                 self.history[-1].eval_acc = float(eval_acc)
                 self.history[-1].eval_macro_acc = float(eval_macro_acc)
+                for entry in eval_metrics + test_metrics:
+                    dataset_repr = entry["dataset"]
+                    self.history[-1].sub_metrics[dataset_repr] = {**entry}
+
                 state.cumAUC += eval_acc * 1
 
                 logger.info(
@@ -460,8 +557,8 @@ class ModelWrapper(ABC):
                         "test_loss": test_loss,
                         "test_acc": test_acc,
                         "test_macro_acc": test_macro_acc,
-                        "cumAUC": state.cumAUC,
-                        "cumAUC_normalized": state.cumAUC / state.epoch,
+                        # "cumAUC": state.cumAUC,
+                        # "cumAUC_normalized": state.cumAUC / state.epoch,
                     }
                 )
                 logger.debug(f"{wandb_logged = }")
@@ -631,8 +728,10 @@ class ModelWrapper(ABC):
         )
         acc = np.mean(predictions == actual_labels)
 
-        logger.info(f"percent trials correct: {acc:.5f}")
-        logger.info(f"# sequences correct: {eval_num_correct} / {len(actual_labels)}")
+        logger.info(f"percent trials correct for dataset {dataset}: {acc:.5f}")
+        logger.info(
+            f"# sequences correct for dataset {dataset}: {eval_num_correct} / {len(actual_labels)}"
+        )
 
         if return_predictions:
             return {
@@ -645,9 +744,9 @@ class ModelWrapper(ABC):
             }
 
         return {
-            "loss": np.mean(losses),
-            "acc": acc,
-            "macro_acc": eval_num_correct / len(actual_labels),
+            "loss": float(np.mean(losses)),
+            "acc": float(acc),
+            "macro_acc": float(eval_num_correct / len(actual_labels)),
         }
 
     def _step(
@@ -720,7 +819,7 @@ class ModelWrapper(ABC):
 
 
 class RNNModelWrapper(ModelWrapper):
-    """ """
+    """provides a wrapper for initializing an RNN"""
 
     class _forward_overridden_RNN(torch.nn.RNN):
         """
@@ -760,12 +859,13 @@ class RNNModelWrapper(ModelWrapper):
 class LSTMModelWrapper(RNNModelWrapper):
     class _forward_overridden_RNN(torch.nn.LSTM):
         """
-        overrides torch.nn.RNN to return only the output tensor, not the hidden state
-        so we can plug into the existing ModelWrapper interface
+        overrides torch.nn.LSTM to return only the output tensor, not the hidden state
+        or cell states so it can plug into the existing ModelWrapper interface easily
         """
 
         def forward(self, input: torch.Tensor, hx: typing.Tuple = None) -> torch.Tensor:
             output, (hidden, cell) = super().forward(input, hx)
+            # `hidden`, `cell` are ignored
             return output
 
     def __init__(self, config: ModelConfig):
@@ -807,7 +907,8 @@ class TransformerModelWrapper(ModelWrapper):
         hooked_config_kwargs = {
             k: v
             for k, v in config_dict.items()
-            if k in allowed_fields and k not in ("from_pretrained", "positional_embedding_type")
+            if k in allowed_fields
+            and k not in ("from_pretrained", "positional_embedding_type")
         }
         hookedtfm_config = HookedTransformerConfig(
             # d_head=config.d_head, # NOTE: formerly, this was passed as a separate argument because it was a @property

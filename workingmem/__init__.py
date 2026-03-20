@@ -3,6 +3,7 @@
 """
 
 import typing
+import copy
 import dataclasses
 import yaml
 import logging
@@ -26,7 +27,7 @@ from workingmem.model import (
     RNNModelWrapper,
     LSTMModelWrapper,
 )
-from workingmem.task import SIRDataset, SIRConfig
+from workingmem.task import SIRDataset, SIRConfig, _T_dataset_or_collection_of_datasets
 from workingmem.utils import print_gpu_mem, wandbapi
 import workingmem.model
 import workingmem.task.SIR
@@ -119,7 +120,7 @@ class MainConfig:
 def main(config: MainConfig):
     """
     given a config, train a model on an SIR dataset, evaluate, and test, all described
-    as per config. wandb is used for logging regardless of sweep or not.
+    as per config. wandb is used for logging regardless of whether this is a 'sweep'.
     """
     supplied_batch_size = config.trainer.batch_size
     config.trainer.batch_size = 256
@@ -137,17 +138,73 @@ def main(config: MainConfig):
         )
 
     # set up the dataset
-    logger.info("loading datasets")
-    train_dataset = SIRDataset(config.dataset)
-    eval_config = from_dict(SIRConfig, dataclasses.asdict(config.dataset))
-    test_config = from_dict(SIRConfig, dataclasses.asdict(config.dataset))
-    eval_config.split, test_config.split = "val", "test"
-    eval_dataset = SIRDataset(eval_config)
-    test_dataset = SIRDataset(test_config)
+    logger.info(f"loading datasets using {config.dataset}")
 
-    logger.info("train dataset size: %s", len(train_dataset))
-    logger.info("eval dataset size: %s", len(eval_dataset))
-    logger.info("test dataset size: %s", len(test_dataset))
+    if isinstance(config.dataset.concurrent_reg, int):
+        # this condition indicates concurrent_reg is supplied a single integer value
+        # (this is the typical case)
+        # we proceed as normal, instantiating an SIRDataset object that generates and
+        # caches the dataset on disk if necessary
+        train_config = copy.deepcopy(config.dataset)
+        eval_config = from_dict(SIRConfig, dataclasses.asdict(train_config))
+        test_config = from_dict(SIRConfig, dataclasses.asdict(train_config))
+        eval_config.split, test_config.split = "val", "test"
+
+        train_dataset = SIRDataset(train_config)
+        eval_dataset = SIRDataset(eval_config)
+        test_dataset = SIRDataset(test_config)
+
+        logger.info("train dataset size: %s", len(train_dataset))
+        logger.info("eval dataset size: %s", len(eval_dataset))
+        logger.info("test dataset size: %s", len(test_dataset))
+
+        # we need to explicitly set `d_vocab` if it isn't supplied via CLI, only if we're not
+        # loading a model from disk
+        if not config.model.d_vocab:
+            config.model.d_vocab = eval_dataset.vocab_size
+
+    else:
+        # this situation indicates we are supplied with a list/tuple of ints
+        # indicating all the possible concurrent_reg values we want mixed into this
+        # dataset, for meta-training
+        # first, we will iterate through the list and generate parent datasets if
+        # needed by initializing them in the "normal" way (construct `SIRDataset` instance,
+        # which will trigger constructing dataset examples and caching it to disk).
+        # second, we will draw a proportionate sample of train, eval, and test examples
+        # from each of these parent datasets. the proportions will be n_examples / len(concurrent_reg_values).
+        # we will assemble these samples into a new mixture dataset for
+        # meta-training.
+
+        concurrent_reg_values = tuple(config.dataset.concurrent_reg)
+        # initialize a train, eval, and test dataset for each of the values and add it to a list
+        train_dataset = []
+        eval_dataset = []
+        test_dataset = []
+        for value in concurrent_reg_values:
+            train_config = copy.deepcopy(config.dataset)
+            train_config.concurrent_reg = value
+            train_config.n_back = value
+            eval_config = from_dict(SIRConfig, dataclasses.asdict(train_config))
+            test_config = from_dict(SIRConfig, dataclasses.asdict(train_config))
+            eval_config.split, test_config.split = "val", "test"
+            logger.info(f"assembling dataset corresponding to {train_config}")
+
+            _train_dataset = SIRDataset(train_config)
+            _eval_dataset = SIRDataset(eval_config)
+            _test_dataset = SIRDataset(test_config)
+
+            train_dataset += [_train_dataset]
+            eval_dataset += [_eval_dataset]
+            test_dataset += [_test_dataset]
+
+            logger.info("...train dataset size: %s", len(_train_dataset))
+            logger.info("...eval dataset size: %s", len(_eval_dataset))
+            logger.info("...test dataset size: %s", len(_test_dataset))
+
+            # we need to explicitly set `d_vocab` if it isn't supplied via CLI, only if we're not
+            # loading a model from disk
+            if not config.model.d_vocab:
+                config.model.d_vocab = _eval_dataset.vocab_size
 
     print_gpu_mem(train_dataset)
     print_gpu_mem(eval_dataset)
@@ -159,11 +216,6 @@ def main(config: MainConfig):
 
     # set up the model
     logger.info("initializing model")
-
-    # we need to explicitly set `d_vocab` if it isn't supplied via CLI, only if we're not
-    # loading a model from disk
-    if not config.model.d_vocab:
-        config.model.d_vocab = eval_dataset.vocab_size
 
     # if we're loading a pretrained model, check if an explicit model is passed, or a directory containing many models is
     # provided, in which case, we'd use the `config.array_task_id` to load the Xth model (modulo total models in dir)
@@ -233,7 +285,6 @@ def main(config: MainConfig):
     )
     print_gpu_mem(model)
 
-    # NOTE!
     new_epochs = int(config.trainer.epochs / (1 - config.trainer.sparsity))
     # adjust epochs for sparsity
     logger.info(
