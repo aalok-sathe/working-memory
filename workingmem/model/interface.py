@@ -136,6 +136,10 @@ class TrainingHistoryEntry:
     test_acc: float
     test_macro_acc: float
 
+    sub_metrics: (
+        typing.Dict[str, float] | None
+    )  # an option to add a training history entry child object in case of using multiple datasets for training and/or evaluation
+
 
 class AbstractPytorchModel(ABC, torch.nn.Module):
     """"""
