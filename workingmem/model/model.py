@@ -10,7 +10,7 @@ import yaml
 # installed packages
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, ConcatDataset, RandomSampler
+from torch.utils.data import DataLoader, ConcatDataset, RandomSampler, Subset
 from tqdm.auto import tqdm
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 
@@ -342,16 +342,39 @@ class ModelWrapper(ABC):
             ]
         else:
             # Create a DataLoader for each dataset with RandomSampler
-            dataloaders = [
-                DataLoader(
-                    d,
-                    sampler=RandomSampler(d, num_samples=len(d) // len(dataset)),
-                    batch_size=training_config.batch_size,
-                    num_workers=1,
-                    pin_memory=True,
-                )
-                for d in dataset
-            ]
+
+            #### IF BLOCKED:
+            if not training_config.interleaved:
+                dataloaders = [
+                    DataLoader(
+                        d,
+                        sampler=RandomSampler(d, num_samples=len(d) // len(dataset)),
+                        batch_size=training_config.batch_size,
+                        num_workers=1,
+                        shuffle=True,  # shuffle=True makes the data shuffled within block but NOT interleaved
+                        pin_memory=True,
+                    )
+                    for d in dataset
+                ]
+
+            #### ELIF INTERLEAVED:
+            else:
+                dataloaders = [
+                    DataLoader(
+                        ConcatDataset(
+                            [
+                                Subset(
+                                    d, indices=np.arange(0, len(d) // len(dataset) + 1)
+                                )
+                                for d in dataset
+                            ]
+                        ),
+                        batch_size=training_config.batch_size,
+                        num_workers=1,
+                        shuffle=True,  # shuffle=True makes the data shuffled within block but NOT interleaved
+                        pin_memory=True,
+                    )
+                ]
 
         _len_train_dataset = (
             sum(len(d) for d in dataset) if isinstance(dataset, list) else len(dataset)
@@ -721,12 +744,19 @@ class ModelWrapper(ABC):
         # predictions.shape = (N_batches * batch_size, seq_len)
         # actual_labels.shape = (N_batches * batch_size, seq_len)
 
+        # ignore the first O(N) (where N = N_BACK or REF_BACK_N or `dataset.concurrent_reg`) trials from
+        # accuracy calculation
+        def _get_warmup_steps(N):
+            return N * 2
+
+        WARMUP_STEPS = _get_warmup_steps(dataset.config.concurrent_reg)
+
         # we want to aggregate over each example in val set rather than each individual answer location
         eval_num_correct = np.sum(
             all(predictions[i] == actual_labels[i])
             for i in range(actual_labels.shape[0])
         )
-        acc = np.mean(predictions == actual_labels)
+        acc = np.mean(predictions[:, WARMUP_STEPS:] == actual_labels[:, WARMUP_STEPS:])
 
         logger.info(f"percent trials correct for dataset {dataset}: {acc:.5f}")
         logger.info(
