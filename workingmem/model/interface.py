@@ -102,10 +102,16 @@ class TrainingConfig:
     # if strategy is 'epoch', then we save every X epochs determined by `save_steps`
     save_steps: typing.Union[int, None] = None
 
-    do_test: bool = True  # evaluate the model on the test set after training?
+    do_test: typing.Union[bool, None] = (
+        True  # evaluate the model on the test set after training?
+    )
 
-    mask_answer_tokens: bool = True  # whether we train the model using answer tokens in the input sequence or not.
-    interleaved: bool = True  # applicable only when multiple datasets are used for training: whether to interleave or block the input datasets.
+    mask_answer_tokens: typing.Union[bool, None] = (
+        True  # whether we train the model using answer tokens in the input sequence or not.
+    )
+    interleaved: typing.Union[bool, None] = (
+        True  # applicable only when multiple datasets are used for training: whether to interleave or block the input datasets.
+    )
 
 
 @dataclasses.dataclass
