@@ -97,7 +97,7 @@ class TrainingConfig:
     # by the dataset length and batch size
     logging_steps_per_epoch: int = 5
     # 'best' saves a checkpoint each time we see a drop in validation loss, named 'best_model.pth'
-    # 'epoch' saves a checkpoint at the end of each epoch named 'epoch_{epoch}.pth' in a subdirectory called 'checkpoints/'
+    # 'epoch' saves a checkpoint at the end of 20 epochs named 'epoch_{epoch}.pth' in a subdirectory called 'checkpoints/'
     save_strategy: typing.Literal["best", "epoch"] = "best"
     # if strategy is 'epoch', then we save every X epochs determined by `save_steps`
     save_steps: typing.Union[int, None] = None
@@ -111,6 +111,11 @@ class TrainingConfig:
     )
     interleaved: typing.Union[bool, None] = (
         True  # applicable only when multiple datasets are used for training: whether to interleave or block the input datasets.
+    )
+    scaffolded: typing.Union[bool, None] = (
+        False  # applicable only when multiple datasets are used for training: whether to scaffold the multiple datasets in training.
+        # scaffolding and interleaving cannot both be true at the same time! scaffolding is sequential in nature, and trains on subsequent
+        # datasets in equally-spaced-out-increments
     )
 
 

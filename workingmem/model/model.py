@@ -330,6 +330,9 @@ class ModelWrapper(ABC):
             )
         ]
 
+        # this IF-condition tests whether this is a singleton dataset rather than a list;
+        # if so, we wrap it in a single-item list
+        # when a singular dataset is passed, there is nothing to interleave or scaffold with
         if isinstance(dataset, GeneratedCachedDataset):
             dataloaders = [
                 DataLoader(
@@ -340,11 +343,11 @@ class ModelWrapper(ABC):
                     pin_memory=True,
                 )
             ]
+        # Create a DataLoader for each dataset within the passed list
         else:
-            # Create a DataLoader for each dataset with RandomSampler
-
-            #### IF BLOCKED:
-            if not training_config.interleaved:
+            #### IF BLOCKED (no interleaving---we train sequentially in the order the datasets are presented,
+            # shuffling within dataset):
+            if not (training_config.interleaved or training_config.scaffolded):
                 dataloaders = [
                     DataLoader(
                         d,
@@ -357,8 +360,12 @@ class ModelWrapper(ABC):
                     for d in dataset
                 ]
 
-            #### ELIF INTERLEAVED:
-            else:
+            #### ELIF INTERLEAVED (items are shuffled across datasets---each next item/trial sequence is drawn at random
+            # from any of the list of supplied datasets without replacement per epoch)
+            elif training_config.interleaved:
+                assert not training_config.scaffolded, (
+                    f"unsupported: passing both {training_config.scaffolded = } and {training_config.interleaved = }"
+                )
                 dataloaders = [
                     DataLoader(
                         ConcatDataset(
@@ -377,7 +384,19 @@ class ModelWrapper(ABC):
                 ]
 
             #### IF SCAFFOLDED: we want to train sequentially for entire epochs on subsequent datasets.
-            # NotImplemented yet
+            # here, we'll simply assemble a list of full-size dataloaders to be used dynamically during training
+            # contingent on epoch number
+            elif training_config.scaffolded:
+                dataloaders = [
+                    DataLoader(
+                        d,
+                        batch_size=training_config.batch_size,
+                        num_workers=1,
+                        shuffle=True,  # shuffle=True makes the data shuffled within block but NOT interleaved
+                        pin_memory=True,
+                    )
+                    for d in dataset
+                ]
 
         _len_train_dataset = (
             sum(len(d) for d in dataset) if isinstance(dataset, list) else len(dataset)
@@ -410,6 +429,7 @@ class ModelWrapper(ABC):
             # so, the max possible value is 1.0 x num_epochs. for instance, a model that achieves 1.0 accuracy starting from
             # epoch 0 will have cumAUC = num_epochs
             cumAUC: float = 0.0
+            dataset_ix: int = 0  # tracks dataset used, relevant for scaffolded training
 
             @property
             def step(self):
@@ -444,11 +464,7 @@ class ModelWrapper(ABC):
             ################################
             #### begin epoch            ####
             ################################
-            # set the model to training mode at the beginning of each epoch, since there is
-            # no guarantee that it will still be in training mode from the previous epoch
-            # if we went into the eval subroutine
-            # NOTE this might not matter, since we don't use standard language modeling
-            # design decisions like dropout
+            # set the model to training mode at the beginning of each epoch
             self.model.train()
 
             # freeze model embeddings (and unembeddings) if requested
@@ -467,9 +483,34 @@ class ModelWrapper(ABC):
 
             self.history[-1].epoch = state.epoch
 
-            # combine the dataloaders into a single iterable right before use so
-            # we can refresh the iterable each epoch
-            train_dataloader = chain.from_iterable(dataloaders)
+            # if this is ordinary training or blocked or interleaved training, we want to use all the datasets from the dataloader
+            if not training_config.scaffolded:
+                # combine the dataloaders into a single iterable right before use so we can refresh the iterable each epoch
+                train_dataloader = chain.from_iterable(dataloaders)
+
+            # if this is scaffolded training, the data distribution to use depends on the epoch, since we'll progressively
+            # shift the training data distribution as training goes on. by default, all training datasets are uniformly distributed
+            # over the total training time, meaning, if 3 datasets are passed, the first 1/3rd epochs will use the first dataset,
+            # the next 1/3rd will use the 2nd, and so on.
+            else:
+                # if we detect the previous epoch had an accuracy of > 0.9
+                # (criterion) then we can move on to the next one
+                if self.history[-1]["eval_acc"] >= 0.9:
+                    state.dataset_ix += 1
+                    state.dataset_ix = min(
+                        state.dataset_ix, len(dataloaders) - 1
+                    )  # prevent index out of bounds error---we can only go up to the max no. of datasets
+
+                # otherwise, by default, pick the dataset that corresponds to the epoch
+                # but, if we had already early-advanced to a higher dataset previously based on reaching criterion
+                # don't regress---stay there even if the epoch-based dataset_ix is lower.
+                else:
+                    epochs_per_chunk = training_config.epochs / len(dataloaders)
+                    epoch_based_dataset_ix = state.epoch // epochs_per_chunk
+                    state.dataset_ix = max(state.dataset_ix, epoch_based_dataset_ix)
+
+                train_dataloader = dataloaders[state.dataset_ix]
+
             for state.epoch_step, inputs in enumerate(train_dataloader):
                 if state.best_val_acc >= 0.999:
                     logger.warning(
@@ -619,6 +660,11 @@ class ModelWrapper(ABC):
             #### end epoch              ####
             ################################
 
+        self.save_checkpoint(
+            training_config.checkpoint_dir,
+            epoch_num=state.epoch,
+        )
+
         if predictions_table is not None:
             wandb.log({"predictions": predictions_table})
 
@@ -632,16 +678,14 @@ class ModelWrapper(ABC):
                     "test_labels",
                 ]
             )
-            test_result = self.test(
-                test_dataset,
-                test_table,
+            test_metrics, test_loss, test_acc, test_macro_acc = self._evaluate_and_log(
+                test_datasets,
+                log_prefix="test",
+                state=state,
+                training_config=training_config,
                 mask_answer_tokens=training_config.mask_answer_tokens,
             )
-            test_loss, test_acc, test_macro_acc = (
-                test_result["loss"],
-                test_result["acc"],
-                test_result["macro_acc"],
-            )
+
             logger.info(f"TEST: {test_loss = }, {test_acc = }, {test_macro_acc = }")
             wandb.log(
                 {
