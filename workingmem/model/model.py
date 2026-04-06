@@ -495,7 +495,10 @@ class ModelWrapper(ABC):
             else:
                 # if we detect the previous epoch had an accuracy of > 0.9
                 # (criterion) then we can move on to the next one
-                if self.history[-1]["eval_acc"] >= 0.9:
+                if (
+                    self.history[-1].eval_acc is not None
+                    and self.history[-1].eval_acc >= 0.9
+                ):
                     state.dataset_ix += 1
                     state.dataset_ix = min(
                         state.dataset_ix, len(dataloaders) - 1
