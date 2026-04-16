@@ -512,6 +512,7 @@ class ModelWrapper(ABC):
                     epoch_based_dataset_ix = state.epoch // epochs_per_chunk
                     state.dataset_ix = max(state.dataset_ix, epoch_based_dataset_ix)
 
+                state.dataset_ix = int(state.dataset_ix)
                 train_dataloader = dataloaders[state.dataset_ix]
 
             for state.epoch_step, inputs in enumerate(train_dataloader):
