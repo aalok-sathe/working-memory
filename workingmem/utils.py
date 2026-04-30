@@ -65,13 +65,28 @@ def _get_wandb_runs(
         metrics["run_id"] = run.name
         metrics["sweep_id"] = sweep_id
         config: typing.Dict[str, typing.Any] = run.config
+        # print(config)
         all_configs = {
-            **config["model"],
-            **config["trainer"],
-            **config["dataset"],
+            **config,
         }
+        for additional_key in ["model", "dataset", "trainer"]:
+            all_configs.update(config.get(additional_key, {}))
+
+        new_columns = {}
         for key in all_configs:
-            metrics[key] = all_configs[key]
+            value = all_configs[key]
+            # if value is not a singleton, we wrap it in a tuple
+            if isinstance(value, list):
+                value = " ".join(map(str, value))
+            new_columns[key] = value
+
+        try:
+            metrics = pd.concat(
+                [metrics, pd.DataFrame(new_columns, index=metrics.index)], axis=1
+            )
+        except ValueError as e:
+            print(e, new_columns)
+            exit()
 
         try:
             dfs += [metrics]
@@ -111,7 +126,8 @@ def get_wandb_runs(
 
     if config_path is not None:
         assert "sweep_dict" in str(config_path), (
-            f"are you sure you passed the correct config? input: {config_path}"
+            f"are you sure you passed the correct config? "
+            f"expected input is 1 YAML file created as a result of creating a sweep. what you provided as input: {config_path}"
         )
         with Path(config_path).open("r") as f:
             created_config = yaml.load(f, yaml.FullLoader)
@@ -122,9 +138,12 @@ def get_wandb_runs(
             sweep_id = sweep["sweep_id"]
             prefix = sweep["username"]
             sweep_df = get_wandb_runs(project_name, sweep_id, prefix)
-            sweep_df_grouped_by_epoch = (
-                sweep_df.groupby(["epoch", "run_id"]).first().reset_index()
-            )
+            try:
+                sweep_df_grouped_by_epoch = (
+                    sweep_df.groupby(["epoch", "run_id"]).first().reset_index()
+                )
+            except KeyError as e:
+                logger.warning(f"SKIPPING {sweep=} due to {e}")
 
             dest = Path(config_path).parent.parent / "downloaded_runs"
             dest.mkdir(exist_ok=True)
