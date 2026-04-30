@@ -1,4 +1,8 @@
 # stdlib
+from typing import Literal
+from typing_extensions import Self
+
+
 import dataclasses
 import typing
 from abc import ABC, abstractmethod
@@ -6,13 +10,13 @@ from pathlib import Path
 import logging
 from itertools import chain
 import yaml
+from collections import OrderedDict
 
 # installed packages
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, ConcatDataset, RandomSampler, Subset
 from tqdm.auto import tqdm
-from transformer_lens import HookedTransformer, HookedTransformerConfig
 
 import wandb
 
@@ -61,6 +65,26 @@ class ModelWrapper(ABC):
         """
         self.model.load_state_dict(state_dict)
 
+    @classmethod
+    def from_checkpoint_dir(cls, ckpt_dir) -> Self:
+        """
+        similar to `ModelWrapper.load_checkpoint` except does not
+        already require an initialized model and config---reads in the model
+        config from the supplied checkpoint directory, initializes a model using
+        that config, then makes a call to `load_checkpoint`.
+        """
+        with (Path(ckpt_dir) / "config.yaml").open("r") as f:
+            config = yaml.load(f, Loader=yaml.SafeLoader)
+
+        # return the appropriate instance based on what child class this is
+        # first, initialize the correct class with `config`
+        # second, call `load_checkpoint` on it
+        config = ModelConfig(**config)
+
+        model = cls(config)
+        model.load_checkpoint(ckpt_dir)
+        return model
+
     def __init__(self, config: ModelConfig):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -87,6 +111,7 @@ class ModelWrapper(ABC):
                 f"any additional options passed to `ModelConfig` will be ignored!\n\t{config}"
             )
             self.load_checkpoint(config.from_pretrained)
+            self.model.to(self.device)
 
         if self.history is None:
             self.history = []
@@ -140,9 +165,20 @@ class ModelWrapper(ABC):
 
         # 3.3 load the state dict into the model: this should overwrite the weights
         _state_dict = torch.load(_state_dict_path, map_location=self.device)
+
+        # if checkpoint uses old Sequential numeric keys, remap to named keys.
+        if any(k.startswith(("0.", "1.", "2.")) for k in _state_dict.keys()):
+            _state_dict = self._rename_state_dict(_state_dict)
+
         self.load_state_dict(_state_dict, _config)
 
         logger.info(f"finished loading model state dict from {_state_dict_path}")
+
+    def _rename_state_dict(self, sd):
+        logger.warning(
+            f"returning state-dict as-is since {self.__class__} has provided no implementation"
+        )
+        return sd
 
     def save_checkpoint(
         self, checkpoint_dir: typing.Union[str, Path], epoch_num: int = None
@@ -868,9 +904,7 @@ class ModelWrapper(ABC):
             )
 
         # shape of logits: (b, seq_len, |V|)
-        # TODO: ERROR: mismatch for model_class 'rnn' ---
-        # TypeError: linear(): argument 'input' (position 1) must be Tensor, not tuple
-        logits = self.model(inputs["token_ids"])
+        logits = self.forward(inputs["token_ids"])
 
         if return_outputs:
             outputs = compute_masked_loss(
@@ -898,22 +932,104 @@ class ModelWrapper(ABC):
             )
             return loss
 
+    def __call__(self, *args, return_hidden_states=False, **kwargs):
+        if return_hidden_states:
+            return self.get_representations_over_sequence(*args, **kwargs)
+        return self.model(*args, **kwargs)
+
+    def forward(self, *args, return_hidden_states=False, **kwargs):
+        return self(*args, return_hidden_states=return_hidden_states, **kwargs)
+
+    @abstractmethod
+    def get_representations_over_sequence(
+        self,
+        trial_sequence: typing.Dict[str, torch.Tensor],
+    ):
+        """
+        method meant to be implemented by each child model class that would support recording
+        internal states of the model, such as, hidden states and outputs per layer for RNNs,
+        memory cells for LSTMs, and possibly attention head outputs/layer-wise outputs for
+        transformer models
+        """
+        NotImplemented
+
 
 class RNNModelWrapper(ModelWrapper):
     """provides a wrapper for initializing an RNN"""
 
     class _forward_overridden_RNN(torch.nn.RNN):
         """
-        overrides torch.nn.RNN to return only the output tensor, not the hidden state
-        so we can plug into the existing ModelWrapper interface
+        overrides torch.nn.RNN to return only the output tensor by default, not
+        the hidden state so we can plug into the existing ModelWrapper interface
         """
 
-        def forward(self, input: torch.Tensor, hx: torch.Tensor = None) -> torch.Tensor:
-            output, hidden = super().forward(input, hx)
-            return output
+        def forward(
+            self,
+            input: torch.Tensor,
+            hx: torch.Tensor = None,
+            return_hidden_states: bool = False,
+        ) -> torch.Tensor:
+            """override default forward"""
+            if not return_hidden_states:
+                output, hidden = super().forward(input, hx)
+                return output
+
+            # else: we want to record all hidden states, so we'll pass in the
+            # inputs one timestep at a time.
+            # the input shape is (b, seq_len) and we want to iterate over the seq_len dimension
+            # and collect the intermediate hidden states at each step. we can actually make a call
+            # to the same `forward` method recursively, but with `return_hidden_states=True` to
+            # get the output at each step with the hidden states. then we'll stack it and return it.
+            all_outputs = []
+            all_hidden_states = []
+            *b, seq_len, _ = input.shape
+            for t in range(seq_len):
+                input_t = input[..., t : t + 1, :]
+                output_t, hx = super().forward(input_t, hx)
+                all_outputs.append(output_t)
+                all_hidden_states.append(hx)
+
+            all_outputs = torch.cat(all_outputs, dim=len(b))
+            all_hidden_states = torch.stack(all_hidden_states, dim=len(b))
+            return all_outputs, all_hidden_states
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
+
+    @classmethod
+    def _rename_state_dict(cls, sd: dict) -> dict:
+        """
+        Map old Sequential numeric keys (0/1/2) -> new named keys (embed/rnn/unembed),
+        using labels from `_get_nn_sequential_block_labels` instead of hardcoding.
+        """
+        old_embed, old_main, old_unembed = cls._get_nn_sequential_block_labels(
+            compat=True
+        )
+        new_embed, new_main, new_unembed = cls._get_nn_sequential_block_labels(
+            compat=False
+        )
+
+        out = {}
+        for k, v in sd.items():
+            if k.startswith(f"{old_embed}."):
+                out[f"{new_embed}.{k[len(old_embed) + 1 :]}"] = v
+            elif k.startswith(f"{old_main}."):
+                out[f"{new_main}.{k[len(old_main) + 1 :]}"] = v
+            elif k.startswith(f"{old_unembed}."):
+                out[f"{new_unembed}.{k[len(old_unembed) + 1 :]}"] = v
+            else:
+                out[k] = v
+        return out
+
+    @classmethod
+    def _get_nn_sequential_block_labels(
+        cls, compat=False
+    ) -> tuple[Literal["0", "embed"], Literal["1", "rnn"], Literal["2", "unembed"]]:
+
+        embed_label, main_label, unembed_label = "embed", "rnn", "unembed"
+        if compat:
+            embed_label, main_label, unembed_label = "0", "1", "2"
+        return embed_label, main_label, unembed_label
 
     def _init_model(self, config: ModelConfig):
         """
@@ -923,18 +1039,106 @@ class RNNModelWrapper(ModelWrapper):
         back to the vocabulary space for language modeling.
         uses boilerplate RNN code from pytorch wherever possible.
         """
+        embed_label, main_label, unembed_label = self._get_nn_sequential_block_labels()
         self.model = torch.nn.Sequential(
-            torch.nn.Embedding(config.d_vocab, config.d_model),
-            self._forward_overridden_RNN(
-                input_size=config.d_model,
-                hidden_size=config.d_hidden,
-                num_layers=config.n_layers,
-                batch_first=True,
-                nonlinearity=config.act_fn,
-                bidirectional=False,
-            ),
-            torch.nn.Linear(config.d_hidden, config.d_vocab),
+            OrderedDict(
+                [
+                    (embed_label, torch.nn.Embedding(config.d_vocab, config.d_model)),
+                    (
+                        main_label,
+                        self._forward_overridden_RNN(
+                            input_size=config.d_model,
+                            hidden_size=config.d_hidden,
+                            num_layers=config.n_layers,
+                            batch_first=True,
+                            nonlinearity=config.act_fn,
+                            bidirectional=False,
+                        ),
+                    ),
+                    (
+                        unembed_label,
+                        torch.nn.Linear(config.d_hidden, config.d_vocab),
+                    ),
+                ]
+            )
         )
+
+    def get_representations_over_sequence(
+        self,
+        trial_sequence: typing.Dict[str, torch.Tensor],
+        mask_answer_tokens=True,
+    ):
+        """
+        run a trial sequence through embed -> RNN/LSTM -> unembed and return
+        intermediate tensors for each of: embedding, RNN/LSTM hidden states, and logits.
+        """
+
+        trial_sequence["token_ids"] = trial_sequence["token_ids"].to(self.device)
+        trial_sequence["answer_locations"] = trial_sequence["answer_locations"].to(
+            self.device
+        )
+        trial_sequence["answer_locations"].requires_grad = False  # not backprop-able
+
+        # a variation we can do here is to remove the actual answer tokens from the inputs
+        # so this is less like a language modeling task and more like a classification task
+        # (which it already is in principle due to not receiving loss on anything but the
+        # answers). however, this way, it should take away the answers implicit in the input
+        # text
+        trial_sequence["answers"] = trial_sequence["token_ids"] * trial_sequence[
+            "answer_locations"
+        ].to(
+            self.device
+        )  # only the relevant token_ids remain non-zeroed-out as `answers`
+
+        if mask_answer_tokens:
+            trial_sequence["token_ids"] = trial_sequence["token_ids"] * (
+                1 - trial_sequence["answer_locations"]
+            )
+
+        # Submodules by attribute name
+        embed = self.model.embed
+        unembed = self.model.unembed
+
+        # RNN block may be named rnn or lstm depending on wrapper
+        if hasattr(self.model, "rnn"):
+            rnn_block = self.model.rnn
+        elif hasattr(self.model, "lstm"):
+            rnn_block = self.model.lstm
+        else:
+            raise AttributeError(
+                "expected 'self.model' to have attribute 'rnn' or 'lstm'"
+            )
+
+        with torch.no_grad():
+            embeddings = embed(trial_sequence["token_ids"])
+
+            # Ask overridden block to return states
+            rnn_out = rnn_block(embeddings, return_hidden_states=True)
+
+            if isinstance(rnn_out, tuple) and len(rnn_out) == 2:
+                seq_out, state = rnn_out
+            else:
+                # Fallback if block doesn't support return_hidden_states
+                seq_out, state = rnn_out, None
+
+            logits = unembed(seq_out)
+
+            result: typing.Dict[str, typing.Any] = {
+                "embeddings": embeddings,
+                "rnn_outputs": seq_out,
+                "logits": logits,
+            }
+
+            if state is not None:
+                # LSTM: (h_n, c_n); RNN/GRU: h_n
+                if isinstance(state, tuple) and len(state) == 2:
+                    h_n, c_n = state
+                    result["hidden_states"] = h_n
+                    result["cell_states"] = c_n
+                else:
+                    result["hidden_states"] = state
+
+            return result
 
 
 class LSTMModelWrapper(RNNModelWrapper):
@@ -944,9 +1148,15 @@ class LSTMModelWrapper(RNNModelWrapper):
         or cell states so it can plug into the existing ModelWrapper interface easily
         """
 
-        def forward(self, input: torch.Tensor, hx: typing.Tuple = None) -> torch.Tensor:
+        def forward(
+            self,
+            input: torch.Tensor,
+            hx: typing.Tuple = None,
+            return_hidden_states: bool = False,
+        ) -> torch.Tensor:
             output, (hidden, cell) = super().forward(input, hx)
-            # `hidden`, `cell` are ignored
+            if return_hidden_states:
+                return output, (hidden, cell)
             return output
 
     def __init__(self, config: ModelConfig):
@@ -960,17 +1170,38 @@ class LSTMModelWrapper(RNNModelWrapper):
         back to the vocabulary space for language modeling.
         uses boilerplate LSTM code from pytorch wherever possible.
         """
+
         self.model = torch.nn.Sequential(
-            torch.nn.Embedding(config.d_vocab, config.d_model),
-            self._forward_overridden_RNN(
-                input_size=config.d_model,
-                hidden_size=config.d_hidden,
-                num_layers=config.n_layers,
-                batch_first=True,
-                bidirectional=False,
-            ),
-            torch.nn.Linear(config.d_hidden, config.d_vocab),
+            OrderedDict(
+                [
+                    ("embed", torch.nn.Embedding(config.d_vocab, config.d_model)),
+                    (
+                        "lstm",
+                        self._forward_overridden_RNN(
+                            input_size=config.d_model,
+                            hidden_size=config.d_hidden,
+                            num_layers=config.n_layers,
+                            batch_first=True,
+                            bidirectional=False,
+                        ),
+                    ),
+                    (
+                        "unembed",
+                        torch.nn.Linear(config.d_hidden, config.d_vocab),
+                    ),
+                ]
+            )
         )
+
+    @classmethod
+    def _get_nn_sequential_block_labels(
+        cls, compat=False
+    ) -> tuple[Literal["0", "embed"], Literal["1", "lstm"], Literal["2", "unembed"]]:
+
+        embed_label, main_label, unembed_label = "embed", "lstm", "unembed"
+        if compat:
+            embed_label, main_label, unembed_label = "0", "1", "2"
+        return embed_label, main_label, unembed_label
 
 
 class TransformerModelWrapper(ModelWrapper):
@@ -981,6 +1212,9 @@ class TransformerModelWrapper(ModelWrapper):
         super().__init__(config)
 
     def _init_model(self, config: ModelConfig):
+
+        from transformer_lens import HookedTransformer, HookedTransformerConfig
+
         # Only pass fields that HookedTransformerConfig actually accepts, and
         # continue to exclude fields that are not constructor arguments.
         config_dict = dataclasses.asdict(config)
@@ -1037,3 +1271,15 @@ class TransformerModelWrapper(ModelWrapper):
         """
         self.model.pos_embed.W_pos.data[:] = 0.0
         self.model.pos_embed.W_pos.requires_grad = False
+
+    def get_representations_over_sequence(
+        self,
+        trial_sequence: typing.Dict[str, torch.Tensor],
+    ):
+        """
+        method meant to be implemented by each child model class that would support recording
+        internal states of the model, such as, hidden states and outputs per layer for RNNs,
+        memory cells for LSTMs, and possibly attention head outputs/layer-wise outputs for
+        transformer models
+        """
+        raise NotImplementedError
