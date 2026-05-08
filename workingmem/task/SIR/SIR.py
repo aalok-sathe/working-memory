@@ -410,7 +410,7 @@ class SIRDataset(GeneratedCachedDataset):
         # more general
         if self.config.global_split_set_control:
             assert mode is None, (
-                "/held-out train/challenge modes not supported for split-set control"
+                "held-out train/challenge modes not supported for split-set control"
                 " (if you think about it, split-set control is already a held-out mode "
                 "that exposes only certain register-item combinations during training)"
             )
@@ -423,8 +423,8 @@ class SIRDataset(GeneratedCachedDataset):
             # it should be OK---there is no randomness involved, so it produces the same
             # item subranges each time called
             # `how_many` is the number of items used with each register per trial sequence.
-            # e.g., for 64 registers and 128 items, `how_many` will be 2, and 2 registers
-            # will be sampled from a larger pool of 4 registers (out of 256) that always occur
+            # e.g., for 64 registers and 128 items, `how_many` will be 2, and 2 items
+            # will be sampled from a larger pool of 4 items (out of 256) that always occur
             # with this register
             how_many = self.config.concurrent_items // self.config.concurrent_reg
             # within each trial sequence, we must have the same number of concurrent items
@@ -610,16 +610,36 @@ class SIRDataset(GeneratedCachedDataset):
 
                 # sample item uniformly at random and make it diff from N* trials back
                 if n_back:
-                    # NOTE there is (currently) no notion of split-set for N-back
-                    # though there could be---for example we could store certain
-                    # items only for odd or even indices
+                    # split set for N-back:
+                    # modulus of N, so that the item pool for the N-back trial
+                    # is different from the item pool for the non-N-back trial.
+                    # but for now, we are just sampling from the same pool of
+                    # items regardless of whether it's an N-back trial or not.
+
+                    # since the split-set-control condition is set up to
+                    # time-lock items to registers, we have to frame N as though
+                    # it were a register---so we can use the register-item
+                    # mapping to determine the item pool for the N-back trial.
+                    MODULO_INDEX = (
+                        len(this_item_seq) % self.config.n_back
+                    )  # 0, 1, ... N-1 (ignore-aware since we're measuring trial idx based on this_item_seq!)
+
+                    this_trial_item_pool = (
+                        register_item_pool[regs_chosen[MODULO_INDEX]]
+                        if self.config.global_split_set_control
+                        else items_chosen
+                    )
+                    this_item = np.random.choice(this_trial_item_pool, p=None).astype(
+                        int
+                    )
 
                     # the below while-loop samples items until drawing one that's different from N ago
-                    this_item = np.random.choice(items_chosen, p=None).astype(int)
                     while (len(this_item_seq) >= self.config.n_back) and (
                         this_item == this_item_seq[-self.config.n_back]
                     ):
-                        this_item = np.random.choice(items_chosen, p=None).astype(int)
+                        this_item = np.random.choice(
+                            this_trial_item_pool, p=None
+                        ).astype(int)
 
                 # sample item with respect to role and make it diff from what's
                 # stored with this role
@@ -643,6 +663,8 @@ class SIRDataset(GeneratedCachedDataset):
                         ).astype(int)
                 this_label = diff
             # enforce "same" condition
+            # this is easier since we don't have to do anything special for
+            # split set: the item only depends on the past
             else:
                 if n_back:  # item same as that from N trials ago
                     this_item = this_item_seq[-self.config.n_back]
