@@ -1,16 +1,17 @@
-import logging
-import typing
 from collections import defaultdict
 from functools import lru_cache
 from itertools import product
+import json
+import logging
 from pathlib import Path
+import typing
 
 import pandas as pd
-import yaml
 from pandas.core.frame import DataFrame
 from tqdm.auto import tqdm
-
 import wandb
+import yaml
+
 import workingmem.utils.plotting as plotting
 
 
@@ -278,6 +279,11 @@ def annotate_trial_seq(
     also in the state, we store the time elapsed since last accessing that role for any instruction,
     as well as last _updating_ that role (i.e., St instruction). we also annotate the current trial's
     answer (same/diff) as well as whether the model got the prediction right (preds vs labels).
+
+    also includes `oracle_memory_state`, a json-serialized `{role: item}` snapshot of the ground-truth
+    memory contents as of the *end* of that trial (i.e., after applying this trial's update, if any) --
+    this is the oracle/ground-truth state a model would need to track internally to solve the task,
+    as opposed to `role`/`item`/`instr`, which describe only the current trial's own instruction.
     """
     trial_seq: typing.List[str] = trial_seq.split()
     roles = set()
@@ -287,6 +293,7 @@ def annotate_trial_seq(
     state = defaultdict(
         lambda: dict(time_since_access=-1, time_since_update=-1, num_accesses=0)
     )
+    oracle_memory: typing.Dict[str, str] = {}
     annotated_seq = []
     for i in range(0, len(trial_seq), 4):
         instr, role, item, ans = trial_seq[i : i + 4]
@@ -300,6 +307,9 @@ def annotate_trial_seq(
             if state[r]["time_since_update"] >= 0:
                 state[r]["time_since_update"] += 1
 
+        if instr == "St":
+            oracle_memory[role] = item
+
         annotated_seq.append({
             "trial_ix": i // 4,
             "instr": instr,
@@ -309,12 +319,83 @@ def annotate_trial_seq(
             "correct": int(preds[i // 4] == labels[i // 4]),
             "label": labels[i // 4],
             **state[role].copy(),
+            "oracle_memory_state": json.dumps(oracle_memory),
         })
         state[role]["time_since_access"] = 0
         if instr == "St":
             state[role]["time_since_update"] = 0
 
     return pd.DataFrame(annotated_seq)
+
+
+def get_annotated_representations(
+    model, example: dict, mask_answer_tokens: bool = True
+) -> pd.DataFrame:
+    """
+    Runs `model.get_representations_over_sequence` on a single (unbatched)
+    dataset example (e.g. `dataset[i]`) and returns a per-token DataFrame that
+    merges the SIR trial annotations from `annotate_trial_seq` (instr, role,
+    item, label, correct, time_since_access, time_since_update, num_accesses)
+    with every representation the model reports for that example
+    (`embeddings`, `hidden_states`/`cell_states`,
+    `percell_hidden_states`/`percell_cell_states` for `LSTMMultiCellWrapper`,
+    `logits`, etc. -- whatever keys that model class's
+    `get_representations_over_sequence` returns).
+
+    A trial spans 4 tokens (instr, role, item, ans) but `annotate_trial_seq`
+    (like `ModelWrapper.evaluate`/`compute_masked_loss`) reasons about one row
+    per trial, gathered at the answer position. To align with the
+    per-timestep representation tensors (each of shape `(seq_len, ...)` where
+    `seq_len` counts *tokens*, not trials), each trial's row from
+    `annotate_trial_seq` is broadcast across its 4 constituent token rows
+    here, plus a `token`/`token_type` ("instr"/"role"/"item"/"ans") column
+    identifying which of the 4 each row corresponds to.
+
+    Predictions are read off the logit *preceding* each answer token
+    (`answer_locations.nonzero() - 1`), mirroring
+    `compute_masked_loss`'s `gathered_logits` -- i.e., the model predicts the
+    answer at the item token's position, one step before the answer token
+    itself appears.
+    """
+    reprs = model.get_representations_over_sequence(
+        example, mask_answer_tokens=mask_answer_tokens
+    )
+
+    # NOTE: `example` (unlike the returned `reprs`) is left batched in-place by
+    # `get_representations_over_sequence` (shape (1, seq_len)) even though it was passed
+    # in unbatched -- only `reprs` gets unbatched before being returned.
+    answer_locations = example["answer_locations"].squeeze(0)
+    answers = example["answers"].squeeze(0)
+    answer_positions = answer_locations.nonzero(as_tuple=True)[0]
+    pred_ids = (
+        reprs["logits"][answer_positions - 1].argmax(dim=-1).detach().cpu().tolist()
+    )
+    label_ids = answers[answer_positions].detach().cpu().tolist()
+
+    trial_df = annotate_trial_seq(pred_ids, label_ids, example["tokens"])
+
+    tokens = example["tokens"].split()
+    token_types = ["instr", "role", "item", "ans"] * len(trial_df)
+    assert len(tokens) == len(token_types), (
+        f"{len(tokens) = } tokens in example but {len(trial_df) = } trials "
+        f"(expected {len(trial_df) * 4} tokens)"
+    )
+
+    annotations = trial_df.loc[trial_df.index.repeat(4)].reset_index(drop=True)
+    annotations.insert(0, "token_ix", range(len(annotations)))
+    annotations.insert(2, "token_type", token_types)
+    annotations.insert(3, "token", tokens)
+    # `label`/`correct` (from `annotate_trial_seq`) are only meaningful for the trial as a
+    # whole (i.e. at its answer token); blank them out on the other 3 broadcast rows.
+    is_ans = annotations["token_type"] == "ans"
+    annotations.loc[~is_ans, ["label", "correct"]] = None
+
+    for key, value in reprs.items():
+        if not hasattr(value, "detach"):  # skip non-tensor entries, if any
+            continue
+        annotations[key] = list(value.detach().cpu().numpy())
+
+    return annotations
 
 
 def load_model_and_dataset(ckpt_path, split="test", epoch=None):
