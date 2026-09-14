@@ -147,9 +147,6 @@ class ModelWrapper(ABC):
         # 3. load model
         # 3.1 load the state dict
 
-        ################################################################
-        # TODO: may be worth supporting state dicts other than `best_model.pth`,
-        ################################################################
         # e.g. `epoch_{epoch}.pth` for taking a model trained for X epochs
         if epoch is not None:
             _state_dict_path = checkpoint_dir / "checkpoints" / f"epoch_{epoch}.pth"
@@ -874,10 +871,10 @@ class ModelWrapper(ABC):
         sparsity: float = 0.0,
         return_outputs=False,
         mask_answer_tokens=True,
-    ) -> typing.Union[
-        torch.Tensor,
-        typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    ]:
+    ) -> (
+        torch.Tensor
+        | typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """
         this method is responsible for computing the loss and optionally the labels
         batch of a batch of inputs
@@ -935,9 +932,26 @@ class ModelWrapper(ABC):
             return loss
 
     def __call__(self, *args, return_hidden_states=False, **kwargs):
+        # allow callers to pass a single unbatched sequence (shape (seq_len,))
+        # instead of a batch (shape (batch, seq_len)); transparently add/remove
+        # the batch dimension so downstream code can always assume a batch dim.
+        unbatched = bool(args) and isinstance(args[0], torch.Tensor) and args[0].dim() == 1
+        if unbatched:
+            args = (args[0].unsqueeze(0), *args[1:])
+
         if return_hidden_states:
-            return self.get_representations_over_sequence(*args, **kwargs)
-        return self.model(*args, **kwargs)
+            output = self.get_representations_over_sequence(*args, **kwargs)
+            if unbatched:
+                output = {
+                    k: (v.squeeze(0) if isinstance(v, torch.Tensor) else v)
+                    for k, v in output.items()
+                }
+            return output
+
+        output = self.model(*args, **kwargs)
+        if unbatched:
+            output = output.squeeze(0)
+        return output
 
     def forward(self, *args, return_hidden_states=False, **kwargs):
         return self(*args, return_hidden_states=return_hidden_states, **kwargs)
@@ -954,6 +968,39 @@ class ModelWrapper(ABC):
         transformer models
         """
         NotImplemented
+
+    @staticmethod
+    def _ensure_batched_trial_sequence(
+        trial_sequence: typing.Dict[str, torch.Tensor],
+    ) -> bool:
+        """
+        allows `get_representations_over_sequence` to accept a single unbatched
+        trial (e.g. `dataset[i]`, whose tensor fields have shape (seq_len,))
+        in addition to an already-batched one (shape (batch, seq_len)); mutates
+        `trial_sequence` in place, adding a batch dim to every 1D tensor field.
+        Returns whether the trial sequence was unbatched.
+        """
+        was_unbatched = (
+            isinstance(trial_sequence.get("token_ids"), torch.Tensor)
+            and trial_sequence["token_ids"].dim() == 1
+        )
+        if was_unbatched:
+            for key, value in trial_sequence.items():
+                if isinstance(value, torch.Tensor):
+                    trial_sequence[key] = value.unsqueeze(0)
+        return was_unbatched
+
+    @staticmethod
+    def _unbatch_result(
+        result: typing.Dict[str, typing.Any], was_unbatched: bool
+    ) -> typing.Dict[str, typing.Any]:
+        """undoes `_ensure_batched_trial_sequence`'s added batch dim on the output dict."""
+        if not was_unbatched:
+            return result
+        return {
+            k: (v.squeeze(0) if isinstance(v, torch.Tensor) else v)
+            for k, v in result.items()
+        }
 
 
 class RNNModelWrapper(ModelWrapper):
@@ -1073,6 +1120,8 @@ class RNNModelWrapper(ModelWrapper):
         intermediate tensors for each of: embedding, RNN/LSTM hidden states, and logits.
         """
 
+        was_unbatched = self._ensure_batched_trial_sequence(trial_sequence)
+
         trial_sequence["token_ids"] = trial_sequence["token_ids"].to(self.device)
         trial_sequence["answer_locations"] = trial_sequence["answer_locations"].to(
             self.device
@@ -1138,7 +1187,7 @@ class RNNModelWrapper(ModelWrapper):
                 else:
                     result["hidden_states"] = state
 
-            return result
+            return self._unbatch_result(result, was_unbatched)
 
 
 class LSTMModelWrapper(RNNModelWrapper):
@@ -1294,7 +1343,7 @@ class LSTMMultiCell(torch.nn.Module):
         input_size: int,
         hidden_size: int,
         num_cells: int,
-        merge_strategy: str = "gated",
+        merge_strategy: str = "concatenate",
     ):
         """
         Args:
@@ -1319,28 +1368,32 @@ class LSTMMultiCell(torch.nn.Module):
         ), f"Unknown merge strategy: {merge_strategy}"
 
         self.cells = torch.nn.ModuleList([
-            torch.nn.LSTMCell(input_size, hidden_size) for _ in range(num_cells)
+            torch.nn.modules.rnn.LSTMCell(input_size, hidden_size)
+            for _ in range(num_cells)
         ])
 
         if merge_strategy == "gated":
             self.merge_weights = torch.nn.Parameter(torch.ones(num_cells))
 
     def forward(
-        self, input: torch.Tensor, hx: typing.Union[tuple, None] = None
+        self, input: torch.Tensor, hx: typing.Union[list, None] = None
     ) -> tuple:
         """
         Args:
-            input: Tensor of shape (batch_size, seq_len, input_size)
-            hx: Initial hidden/cell states (optional)
+            input: Tensor of shape (batch_size, input_size)
+            hx: per-cell hidden/cell states: a list (length `num_cells`) of
+                `(h, c)` tensor tuples, one per parallel cell (optional). NOTE:
+                this is *not* the merged `(h_n, c_n)` returned by this method---
+                callers that want to carry state across successive calls (e.g. to
+                process a sequence one timestep at a time) must feed back the
+                `cell_hx` list this method returns, not the merged state.
 
         Returns:
             output: Merged output tensor
             (h_n, c_n): Merged final hidden and cell states
+            cell_hx: updated per-cell `hx` list, to be passed back in on the next call
         """
-        try:
-            batch_size, seq_len, _ = input.shape
-        except ValueError:
-            batch_size, seq_len, _ = [1, *input.shape]
+        batch_size, input_size = input.shape
 
         if hx is None:
             hx = [
@@ -1363,27 +1416,28 @@ class LSTMMultiCell(torch.nn.Module):
 
         outputs = []
 
-        for t in range(seq_len):
-            x_t = input[:, t, :]
+        # for t in range(seq_len):
+        x_t = input  # [:, t, :]
 
-            cell_outputs = []
-            for cell_idx, cell in enumerate(self.cells):
-                h_t, c_t = cell(x_t, hx[cell_idx])
-                cell_outputs.append(h_t)
-                hx[cell_idx] = (h_t, c_t)
+        cell_outputs = []
+        for cell_idx, cell in enumerate(self.cells):
+            h_t, c_t = cell(x_t, hx[cell_idx])
+            cell_outputs.append(h_t)
+            hx[cell_idx] = (h_t, c_t)
 
-            outputs.append(torch.stack(cell_outputs, dim=0))
+        outputs.append(torch.stack(cell_outputs, dim=0))
 
         outputs = torch.stack(outputs, dim=2)
 
         h_n = torch.stack([h for h, c in hx], dim=0)
         c_n = torch.stack([c for h, c in hx], dim=0)
 
-        return self._merge_outputs(outputs, h_n, c_n)
+        merged_output, merged_state = self._merge_outputs(outputs, h_n, c_n)
+        return merged_output, merged_state, hx
 
     def _merge_outputs(
         self, outputs: torch.Tensor, h_n: torch.Tensor, c_n: torch.Tensor
-    ) -> tuple:
+    ) -> typing.Tuple[torch.Tensor, typing.Tuple[torch.Tensor, torch.Tensor]]:
         """
         Merge outputs from all cells according to merge strategy.
 
@@ -1428,34 +1482,59 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
 
     def _init_model(self, config: ModelConfig):
         num_lstm_cells = getattr(config, "num_lstm_cells", 3)
-        lstm_merge_strategy = getattr(config, "lstm_merge_strategy", "gated")
+        lstm_merge_strategy = getattr(config, "lstm_merge_strategy", "concatenate")
 
         class _forward_overridden_MultiCellLSTM(LSTMMultiCell):
             def forward(
-                self, input: torch.Tensor, hx=None, return_hidden_states: bool = False
+                self,
+                input: torch.Tensor,
+                hx=None,
+                return_hidden_states: bool = False,
+                return_percell_states: bool = False,
             ):
-                if not return_hidden_states:
-                    output, _ = super().forward(input, hx)
-                    return output
+                # `LSTMMultiCell.forward` (the base class) only processes a single
+                # timestep (input shape (batch, input_size)), so we must loop over
+                # the sequence dimension ourselves regardless of `return_hidden_states`.
+                batch_size, seq_len, input_size = input.shape
 
                 all_outputs = []
                 all_h_states = []
                 all_c_states = []
-
-                batch_size, seq_len, input_size = input.shape
-                hx = None
+                all_percell_h = []
+                all_percell_c = []
 
                 for t in range(seq_len):
-                    x_t = input[:, t : t + 1, :]
-                    output_t, (h_t, c_t) = super().forward(x_t, hx)
+                    x_t = input[:, t, :]
+                    # NOTE: `hx` here must be the raw per-cell state list that
+                    # `LSTMMultiCell.forward` returns (not the merged (h, c) states),
+                    # so that recurrence is carried per-cell across timesteps.
+                    output_t, (h_t, c_t), hx = super().forward(x_t, hx)
                     all_outputs.append(output_t)
                     all_h_states.append(h_t)
                     all_c_states.append(c_t)
-                    hx = (h_t, c_t)
+
+                    if return_percell_states:
+                        # hx: list (len num_cells) of (h, c) tuples, each (batch, hidden_size)
+                        all_percell_h.append(torch.stack([h for h, c in hx], dim=1))
+                        all_percell_c.append(torch.stack([c for h, c in hx], dim=1))
 
                 all_outputs = torch.cat(all_outputs, dim=1)
+
+                if not return_hidden_states:
+                    return all_outputs
+
                 all_h_states = torch.stack(all_h_states, dim=1)
                 all_c_states = torch.stack(all_c_states, dim=1)
+
+                if return_percell_states:
+                    # (batch, seq_len, num_cells, hidden_size)
+                    all_percell_h = torch.stack(all_percell_h, dim=1)
+                    all_percell_c = torch.stack(all_percell_c, dim=1)
+                    return (
+                        all_outputs,
+                        (all_h_states, all_c_states),
+                        (all_percell_h, all_percell_c),
+                    )
 
                 return all_outputs, (all_h_states, all_c_states)
 
@@ -1484,6 +1563,64 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
                 ),
             ])
         )
+
+    def get_representations_over_sequence(
+        self,
+        trial_sequence: typing.Dict[str, torch.Tensor],
+        mask_answer_tokens: bool = True,
+    ):
+        """
+        Same as `RNNModelWrapper.get_representations_over_sequence`, but additionally
+        reports each of the `num_lstm_cells` independent LSTM cells' own (unmerged)
+        hidden/cell states, since `hidden_states`/`cell_states` there are merged
+        across cells according to `lstm_merge_strategy` (e.g. "gated" merging stays
+        at width `d_hidden` regardless of `num_lstm_cells`, unlike "concatenate").
+
+        Adds two keys to the returned dict:
+            - "percell_hidden_states": shape (seq_len, num_lstm_cells, d_hidden)
+            - "percell_cell_states": shape (seq_len, num_lstm_cells, d_hidden)
+        """
+        was_unbatched = self._ensure_batched_trial_sequence(trial_sequence)
+
+        trial_sequence["token_ids"] = trial_sequence["token_ids"].to(self.device)
+        trial_sequence["answer_locations"] = trial_sequence["answer_locations"].to(
+            self.device
+        )
+        trial_sequence["answer_locations"].requires_grad = False
+
+        trial_sequence["answers"] = trial_sequence["token_ids"] * trial_sequence[
+            "answer_locations"
+        ].to(self.device)
+
+        if mask_answer_tokens:
+            trial_sequence["token_ids"] = trial_sequence["token_ids"] * (
+                1 - trial_sequence["answer_locations"]
+            )
+
+        embed = self.model.embed
+        unembed = self.model.unembed
+        lstm_block = self.model.lstm
+
+        with torch.no_grad():
+            embeddings = embed(trial_sequence["token_ids"])
+
+            seq_out, (h_n, c_n), (percell_h, percell_c) = lstm_block(
+                embeddings, return_hidden_states=True, return_percell_states=True
+            )
+
+            logits = unembed(seq_out)
+
+            result = {
+                "embeddings": embeddings,
+                "rnn_outputs": seq_out,
+                "logits": logits,
+                "hidden_states": h_n,
+                "cell_states": c_n,
+                "percell_hidden_states": percell_h,
+                "percell_cell_states": percell_c,
+            }
+
+            return self._unbatch_result(result, was_unbatched)
 
 
 class RIMModelWrapper(ModelWrapper):
@@ -1531,6 +1668,8 @@ class RIMModelWrapper(ModelWrapper):
 
         Returns dict with keys: embeddings, rim_outputs, logits
         """
+        was_unbatched = self._ensure_batched_trial_sequence(trial_sequence)
+
         trial_sequence["token_ids"] = trial_sequence["token_ids"].to(self.device)
 
         if mask_answer_tokens and "answer_locations" in trial_sequence:
@@ -1565,7 +1704,7 @@ class RIMModelWrapper(ModelWrapper):
             if mechanism_states is not None:
                 result["mechanism_states"] = mechanism_states
 
-            return result
+            return self._unbatch_result(result, was_unbatched)
 
     def _get_nn_sequential_block_labels(self, compat: bool = False) -> tuple:
         embed_label, main_label, unembed_label = "embed", "rim", "unembed"
