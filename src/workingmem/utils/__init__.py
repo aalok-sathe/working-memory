@@ -140,7 +140,9 @@ def get_wandb_runs(
 
 
 @typing.overload
-def get_wandb_runs(config_path: typing.Union[str, Path], samples: int) -> DataFrame: ...
+def get_wandb_runs(
+    config_path: typing.Union[str, Path], samples: int, download_steps: bool
+) -> DataFrame: ...
 
 
 def get_wandb_runs(
@@ -149,6 +151,7 @@ def get_wandb_runs(
     prefix=wandbapi.viewer.username,
     config_path: typing.Union[str, Path] = None,
     samples=10_000,
+    download_steps: bool = False,
 ) -> DataFrame:
 
     if sweep_id is None:
@@ -169,7 +172,7 @@ def get_wandb_runs(
             project_name = sweep["project_id"]
             sweep_id = sweep["sweep_id"]
             prefix = sweep["username"]
-            sweep_df = get_wandb_runs(project_name, sweep_id, prefix)
+            sweep_df = get_wandb_runs(project_name, sweep_id, prefix, samples=samples)
             try:
                 sweep_df_grouped_by_epoch = (
                     sweep_df.groupby(["epoch", "run_id"]).first().reset_index()
@@ -179,11 +182,12 @@ def get_wandb_runs(
 
             dest = Path(config_path).parent.parent / "downloaded_runs"
             dest.mkdir(exist_ok=True)
-            sweep_df.to_csv(dest / (sweep_id + "_steps.csv"))
+            if download_steps:
+                sweep_df.to_csv(dest / (sweep_id + "_steps.csv"))
             sweep_df_grouped_by_epoch.to_csv(dest / (sweep_id + "_epochs.csv"))
 
     else:
-        return _get_wandb_runs(project_name, sweep_id, prefix)
+        return _get_wandb_runs(project_name, sweep_id, prefix, samples=samples)
 
 
 def _flatten_collection_of_tuples(

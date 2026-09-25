@@ -489,7 +489,7 @@ def entrypoint():
                             ],
                         )
                     )
-                (S.parent / "batch_output").mkdir(exist_ok=True)
+                (S.parent / "batch-output").mkdir(exist_ok=True)
 
             S = Path(
                 f"{config.wandb.from_config}_experiments/scripts/RUN_ALL_{timestamp}.sh"
@@ -516,7 +516,9 @@ def entrypoint():
 
     # case 1.1 is we fetch the runs corresponding a YAML file provided.
     elif config.wandb.download_runs is not None:
-        get_wandb_runs(config.wandb.download_runs)
+        get_wandb_runs(
+            config.wandb.download_runs, download_steps=config.wandb.download_steps
+        )
 
     # case 2 is we run a sweep
     elif config.wandb.run_sweep:
