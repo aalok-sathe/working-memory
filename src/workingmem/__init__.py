@@ -103,13 +103,34 @@ class MainConfig:
     filter_by_accuracy: typing.Union[bool, None] = None
     filter_by_accuracy_threshold: float = 0.7
 
-    # names of partitions to utilize in submitting jobs to. we will uniformly alternate
-    # between them for each condition we construct
+    # distinct partitions to submit jobs to. assignment across these is no longer a
+    # hardcoded ratio -- it's computed live per sweep-creation call from each
+    # partition's QOS GPU cap (see `_get_partition_gpu_cap` in workingmem/utils),
+    # proportionally interleaved via `_weighted_partition_sequence`, so it tracks
+    # `sacctmgr` QOS policy automatically rather than needing hand-tuning here.
     gpu_partition_names: tuple = (
         "3090-gcondo",
-        "3090-gcondo",
-        # "gpu",
         "gpu-he --account=carney-mjfrank-condo2",
+    )
+
+    # NOTE (2026-09-29): number of concurrent wandb-agent/training processes to pack
+    # onto a single --gres=gpu:1 allocation, keyed by the exact partition string in
+    # gpu_partition_names. Static per-partition-class tier (not adaptive), from
+    # empirical nvidia-smi compute-utilization samples across running jobs:
+    #   - 3090-gcondo (RTX 3090): 1 -- a single process already saturates GPU
+    #     compute (~100%/41% util observed); packing more would only slow every
+    #     co-located process down for no throughput gain.
+    #   - gpu-he/carney (mixed A6000/H100/Blackwell Pro 6000): 2 -- most sampled
+    #     nodes had real compute headroom (2-41% util from 1 job; H100 at 8%), kept
+    #     conservative rather than 3+ since we don't control which specific node/GPU
+    #     type we land on, and one Blackwell sample was already at 96% from 1 job
+    #     alone (even top-tier hardware isn't guaranteed headroom for this
+    #     compute-bound small-batch multicell-LSTM workload).
+    gpu_partition_concurrency: dict = dataclasses.field(
+        default_factory=lambda: {
+            "3090-gcondo": 1,
+            "gpu-he --account=carney-mjfrank-condo2": 2,
+        }
     )
 
     def __post_init__(self, *args, **kwargs):

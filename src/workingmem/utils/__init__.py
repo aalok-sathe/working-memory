@@ -69,6 +69,96 @@ def print_gpu_mem(obj: typing.Any = None):
         _logger.info("No GPU available; no memory report.")
 
 
+def _get_partition_gpu_cap(partition_arg: str, user: str) -> int:
+    """
+    Theoretical max GPUs `user` could concurrently hold via `partition_arg` (e.g.
+    "gpu-he --account=carney-mjfrank-condo2"), from static SLURM QOS config
+    (MaxTRESPU, falling back to GrpTRES) -- not current occupancy. These are policy
+    settings, not runtime state, so this is safe to (re)query at every sweep-creation
+    call rather than needing to be cached or kept in sync by hand.
+    """
+    import re
+    import subprocess
+
+    parts = partition_arg.split()
+    partition = parts[0]
+    account = next(
+        (p.split("=", 1)[1] for p in parts[1:] if p.startswith("--account=")), None
+    )
+
+    assoc_cmd = [
+        "sacctmgr",
+        "show",
+        "assoc",
+        f"user={user}",
+        "format=Account,Partition,QOS",
+        "-p",
+        "--noheader",
+    ]
+    assoc_out = subprocess.run(
+        assoc_cmd, capture_output=True, text=True, check=True
+    ).stdout
+    qos = next(
+        (
+            row[2]
+            for line in assoc_out.strip().splitlines()
+            if (row := line.strip("|").split("|"))
+            and row[1] == partition
+            and (account is None or row[0] == account)
+        ),
+        None,
+    )
+    if qos is None:
+        raise RuntimeError(
+            f"could not resolve QOS for partition={partition!r} account={account!r}"
+        )
+
+    qos_cmd = [
+        "sacctmgr",
+        "show",
+        "qos",
+        f"name={qos}",
+        "format=MaxTRESPU,GrpTRES",
+        "-p",
+        "--noheader",
+    ]
+    max_tres_pu, grp_tres = (
+        subprocess.run(qos_cmd, capture_output=True, text=True, check=True)
+        .stdout.strip("|\n")
+        .split("|")[:2]
+    )
+
+    def _extract_gpu(tres_str):
+        m = re.search(r"gres/gpu=(\d+)", tres_str)
+        return int(m.group(1)) if m else None
+
+    cap = _extract_gpu(max_tres_pu) or _extract_gpu(grp_tres)
+    if cap is None:
+        raise RuntimeError(f"QOS {qos!r} has no gres/gpu cap in MaxTRESPU or GrpTRES")
+    return cap
+
+
+def _weighted_partition_sequence(
+    partitions: typing.List[str], weights: typing.List[int], n: int
+) -> typing.List[str]:
+    """
+    Length-`n` list assigning each of `partitions` proportionally to `weights` (e.g.
+    QOS GPU caps from `_get_partition_gpu_cap`), interleaved evenly rather than
+    grouped in blocks, via the standard smooth-weighted-round-robin algorithm (as
+    used by e.g. nginx upstream load balancing).
+    """
+    current = [0] * len(partitions)
+    total = sum(weights)
+    result = []
+    for _ in range(n):
+        for i in range(len(partitions)):
+            current[i] += weights[i]
+        best = max(range(len(partitions)), key=lambda i: current[i])
+        result.append(partitions[best])
+        current[best] -= total
+    return result
+
+
 @lru_cache(maxsize=None)
 def _get_wandb_runs(
     project_name: str, sweep_id: str, prefix=wandbapi.viewer.username, samples=20_000
@@ -179,6 +269,7 @@ def get_wandb_runs(
                 )
             except KeyError as e:
                 _logger.warning(f"SKIPPING {sweep=} due to {e}")
+                continue
 
             dest = Path(config_path).parent.parent / "downloaded_runs"
             dest.mkdir(exist_ok=True)

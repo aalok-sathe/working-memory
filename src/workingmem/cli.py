@@ -1,4 +1,5 @@
 import dataclasses
+import os
 import yaml
 from pathlib import Path
 from datetime import datetime
@@ -316,7 +317,12 @@ def entrypoint():
         ╰────────────────────────────────────────────────────────────────────────────────────╯
     ```
     """
-    from workingmem.utils import parse_config, get_wandb_runs
+    from workingmem.utils import (
+        parse_config,
+        get_wandb_runs,
+        _get_partition_gpu_cap,
+        _weighted_partition_sequence,
+    )
 
     config = tyro.cli(MainConfig, config=(tyro.conf.CascadeSubcommandArgs,))
 
@@ -419,6 +425,9 @@ def entrypoint():
             # a product of all possible values each variable takes
             sweep_records = []
             sweep_commands = []
+            python_commands = []  # parallel list, index-aligned with sweep_commands
+
+            n_seeds = len(sweep_config["parameters"]["model.seed"]["values"])
 
             for param_set in parse_config(from_config_params):
                 this_sweep_config = sweep_config.copy()
@@ -435,6 +444,7 @@ def entrypoint():
                     this_sweep_config, project=config.wandb.project_name
                 )
                 python_command = f"python3 -m workingmem --wandb.run_sweep --wandb.sweep_id {config.wandb.prefix}/{config.wandb.project_name}/{sweep_id}"
+                python_commands.append(python_command)
 
                 # what makes this sweep special?
                 sweep_commands.append(
@@ -452,8 +462,10 @@ def entrypoint():
                         := f"https://wandb.ai/{config.wandb.prefix}/{config.wandb.project_name}/sweeps/{sweep_id}"
                     )
                     + "\n"
-                    + python_command
-                    + "\n"
+                    # python_command is no longer interpolated here -- left as a
+                    # {training_commands} placeholder filled per-partition below, since
+                    # the number of packed copies depends on which partition this sweep
+                    # is assigned to.
                 )
                 sweep_records += [
                     {
@@ -475,7 +487,28 @@ def entrypoint():
             with P.open("w") as f:
                 yaml.dump(sweep_records, f)
 
-            for ix, sweep_command in enumerate(sweep_commands):
+            # live QOS-cap lookup + proportional, interleaved partition assignment,
+            # replacing the old `ix % len(config.gpu_partition_names)` modulo cycling.
+            partition_gpu_caps = [
+                _get_partition_gpu_cap(p, user=os.environ["USER"])
+                for p in config.gpu_partition_names
+            ]
+            partition_sequence = _weighted_partition_sequence(
+                list(config.gpu_partition_names),
+                partition_gpu_caps,
+                len(sweep_commands),
+            )
+
+            for ix, (sweep_command, python_command) in enumerate(
+                zip(sweep_commands, python_commands)
+            ):
+                partition_arg = partition_sequence[ix]
+                n_concurrent = config.gpu_partition_concurrency[partition_arg]
+                array_upper_bound = -(-n_seeds // n_concurrent)  # ceil(n_seeds / n_concurrent)
+                training_commands = "\n".join(
+                    f"{python_command} &" for _ in range(n_concurrent)
+                )
+
                 S = Path(
                     f"{config.wandb.from_config}_experiments/scripts/{timestamp}_{ix}.sh"
                 )
@@ -484,9 +517,10 @@ def entrypoint():
                     f.write(
                         sweep_command.format(
                             batch_output_prefix=str(S.parent) + "/",
-                            slurm_partition_argument=config.gpu_partition_names[
-                                ix % len(config.gpu_partition_names)
-                            ],
+                            slurm_partition_argument=partition_arg,
+                            array_upper_bound=array_upper_bound,
+                            n_concurrent=n_concurrent,
+                            training_commands=training_commands,
                         )
                     )
                 (S.parent / "batch-output").mkdir(exist_ok=True)
