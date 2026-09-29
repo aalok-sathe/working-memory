@@ -416,9 +416,10 @@ class SIRDataset(GeneratedCachedDataset):
         ).astype(int)
 
         # fix this at trial sequence level!
-        prior_over_roles = np.random.dirichlet(
-            np.ones(len(regs_chosen)), size=1
-        ).squeeze()
+        # NOTE: index with [0] rather than .squeeze() -- squeeze() would also
+        # collapse the roles axis itself when concurrent_reg == 1, leaving a
+        # 0-d scalar that np.random.choice(..., p=...) can't consume.
+        prior_over_roles = np.random.dirichlet(np.ones(len(regs_chosen)), size=1)[0]
 
         register_item_pool = {}
         # typically, we'll be using split-set control when n_reg = 2 and

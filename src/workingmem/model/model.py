@@ -1480,11 +1480,48 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
 
+    @classmethod
+    def _get_nn_sequential_block_labels(
+        cls, compat=False
+    ) -> tuple[Literal["0", "embed"], Literal["1", "lstm"], Literal["2", "unembed"]]:
+
+        embed_label, main_label, unembed_label = "embed", "lstm", "unembed"
+        if compat:
+            embed_label, main_label, unembed_label = "0", "1", "2"
+        return embed_label, main_label, unembed_label
+
     def _init_model(self, config: ModelConfig):
         num_lstm_cells = getattr(config, "num_lstm_cells", 3)
         lstm_merge_strategy = getattr(config, "lstm_merge_strategy", "concatenate")
+        num_layers = getattr(config, "n_layers", 1)
 
-        class _forward_overridden_MultiCellLSTM(LSTMMultiCell):
+        class _forward_overridden_MultiCellLSTM(torch.nn.Module):
+            """
+            Stacks `num_layers` independent `LSTMMultiCell` layers, mirroring how
+            `torch.nn.LSTM(num_layers=...)` stacks layers: each layer's merged
+            output (per `merge_strategy`) feeds as input to the next layer.
+            """
+
+            def __init__(
+                self, input_size, hidden_size, num_cells, merge_strategy, num_layers
+            ):
+                super().__init__()
+                self.num_layers = num_layers
+                layer_output_size = (
+                    hidden_size * num_cells
+                    if merge_strategy == "concatenate"
+                    else hidden_size
+                )
+                self.layers = torch.nn.ModuleList([
+                    LSTMMultiCell(
+                        input_size=input_size if layer_idx == 0 else layer_output_size,
+                        hidden_size=hidden_size,
+                        num_cells=num_cells,
+                        merge_strategy=merge_strategy,
+                    )
+                    for layer_idx in range(num_layers)
+                ])
+
             def forward(
                 self,
                 input: torch.Tensor,
@@ -1492,10 +1529,14 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
                 return_hidden_states: bool = False,
                 return_percell_states: bool = False,
             ):
-                # `LSTMMultiCell.forward` (the base class) only processes a single
-                # timestep (input shape (batch, input_size)), so we must loop over
-                # the sequence dimension ourselves regardless of `return_hidden_states`.
+                # `LSTMMultiCell.forward` only processes a single timestep (input
+                # shape (batch, input_size)), so we must loop over the sequence
+                # dimension ourselves regardless of `return_hidden_states`.
                 batch_size, seq_len, input_size = input.shape
+
+                if hx is None:
+                    # one raw per-cell state list (or None) per stacked layer
+                    hx = [None] * self.num_layers
 
                 all_outputs = []
                 all_h_states = []
@@ -1504,19 +1545,33 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
                 all_percell_c = []
 
                 for t in range(seq_len):
-                    x_t = input[:, t, :]
-                    # NOTE: `hx` here must be the raw per-cell state list that
-                    # `LSTMMultiCell.forward` returns (not the merged (h, c) states),
-                    # so that recurrence is carried per-cell across timesteps.
-                    output_t, (h_t, c_t), hx = super().forward(x_t, hx)
+                    layer_input = input[:, t, :]
+                    for layer_idx, layer in enumerate(self.layers):
+                        # NOTE: `hx[layer_idx]` here must be the raw per-cell state
+                        # list that `LSTMMultiCell.forward` returns (not the merged
+                        # (h, c) states), so recurrence is carried per-cell across
+                        # timesteps.
+                        output_t, (h_t, c_t), hx[layer_idx] = layer(
+                            layer_input, hx[layer_idx]
+                        )
+                        # `output_t` carries an artificial seq-dim of size 1 (see
+                        # `LSTMMultiCell.forward`/`_merge_outputs`); squeeze it
+                        # before feeding into the next stacked layer.
+                        layer_input = output_t.squeeze(1)
+
                     all_outputs.append(output_t)
                     all_h_states.append(h_t)
                     all_c_states.append(c_t)
 
                     if return_percell_states:
-                        # hx: list (len num_cells) of (h, c) tuples, each (batch, hidden_size)
-                        all_percell_h.append(torch.stack([h for h, c in hx], dim=1))
-                        all_percell_c.append(torch.stack([c for h, c in hx], dim=1))
+                        # only the last layer's per-cell states are reported, since
+                        # those directly feed the unembedding after merging
+                        all_percell_h.append(
+                            torch.stack([h for h, c in hx[-1]], dim=1)
+                        )
+                        all_percell_c.append(
+                            torch.stack([c for h, c in hx[-1]], dim=1)
+                        )
 
                 all_outputs = torch.cat(all_outputs, dim=1)
 
@@ -1548,6 +1603,7 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
                         hidden_size=config.d_hidden,
                         num_cells=num_lstm_cells,
                         merge_strategy=lstm_merge_strategy,
+                        num_layers=num_layers,
                     ),
                 ),
                 (
@@ -1575,6 +1631,9 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
         hidden/cell states, since `hidden_states`/`cell_states` there are merged
         across cells according to `lstm_merge_strategy` (e.g. "gated" merging stays
         at width `d_hidden` regardless of `num_lstm_cells`, unlike "concatenate").
+        When `config.n_layers > 1` (stacked `LSTMMultiCell` layers), only the last
+        layer's per-cell states are reported here, since those are what directly
+        feed the unembedding after merging.
 
         Adds two keys to the returned dict:
             - "percell_hidden_states": shape (seq_len, num_lstm_cells, d_hidden)

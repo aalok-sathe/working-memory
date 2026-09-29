@@ -109,7 +109,7 @@ class MainConfig:
         "3090-gcondo",
         "3090-gcondo",
         # "gpu",
-        "gpu-he --account=carney-frankmj-condo2",
+        "gpu-he --account=carney-mjfrank-condo2",
     )
 
     def __post_init__(self, *args, **kwargs):
