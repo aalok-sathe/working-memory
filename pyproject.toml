@@ -34,6 +34,7 @@ dev = [
     "ipykernel>=6.29.5",
     "ipython>=8.33.0",
     "jupyter>=1.1.1",
+    "marimo>=0.24.2",
     "pandas>=2.3.3",
     "pdoc>=15.0.1",
     "plotly[express]>=6.0.1",

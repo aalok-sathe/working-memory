@@ -72,6 +72,10 @@ class WandbConfig:
         # in a directory called `downloaded_runs` in the same directory structure
         # nested under the parent config's experiments structure
     )
+    download_steps: bool = False  # only relevant alongside `download_runs`. if True,
+    # also write per-step history to `<sweep_id>_steps.csv` (the raw wandb.history()
+    # pull, one row per logged step -- much larger than the epoch-level summary).
+    # default False: only `<sweep_id>_epochs.csv` is written.
     """
     `from_config`: only applicable with `create_sweep=True`. reads in a config
     file (YAML) if supplied that enumerates variations over individual variables
@@ -105,7 +109,7 @@ class MainConfig:
         "3090-gcondo",
         "3090-gcondo",
         # "gpu",
-        "gpu-he --account=carney-frankmj-condo2",
+        "gpu-he --account=carney-mjfrank-condo2",
     )
 
     def __post_init__(self, *args, **kwargs):

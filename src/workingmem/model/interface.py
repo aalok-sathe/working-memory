@@ -1,13 +1,9 @@
 # stdlib
-import dataclasses
-import typing
 from abc import ABC, abstractmethod
-
-# from pathlib import Path
+import dataclasses
 import logging
-# import yaml
+import typing
 
-# installed packages
 import numpy as np
 import torch
 # from torch.utils.data import DataLoader
@@ -79,7 +75,7 @@ class ModelConfig:
 
     # Multi-cell LSTM parameters
     num_lstm_cells: int = 3  # number of parallel LSTM cells in LSTMMultiCell
-    lstm_merge_strategy: str = "gated"  # "average", "concatenate", or "gated"
+    lstm_merge_strategy: str = "concatenate"  # "average", "concatenate", or "gated"
 
     # RIM (Recurrent Independent Mechanisms) parameters
     num_mechanisms: int = 4  # number of independent mechanisms in RIM
