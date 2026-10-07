@@ -294,9 +294,9 @@ def entrypoint():
         │       the program to run with a wandb sweep agent (default: run_wm.py)             │
         │ --wandb.from-config {None}|STR                                                     │
         │       (default: None)                                                              │
-        │ --wandb.prefix STR                                                                 │
-        │       account prefix where your wandb sweeps are created. login to wandb.ai in a   │
-        │       browser to find out! (default: aloxatel)                                     │
+        │ --wandb.prefix STR                                                                  │
+        │       wandb entity (personal username or team name) where your wandb sweeps are    │
+        │       created. login to wandb.ai in a browser to find out! (default: aloxatel)      │
         │ --wandb.download-runs {None}|STR                                                   │
         │       `from_config`: only applicable with `create_sweep=True`. reads in a config   │
         │       file (YAML) if supplied that enumerates variations over individual variables │
@@ -441,7 +441,9 @@ def entrypoint():
                 this_cumulative_param_set = this_sweep_config["parameters"]
 
                 sweep_id = wandb.sweep(
-                    this_sweep_config, project=config.wandb.project_name
+                    this_sweep_config,
+                    entity=config.wandb.prefix,
+                    project=config.wandb.project_name,
                 )
                 python_command = f"python3 -m workingmem --wandb.run_sweep --wandb.sweep_id {config.wandb.prefix}/{config.wandb.project_name}/{sweep_id}"
                 python_commands.append(python_command)
@@ -473,7 +475,8 @@ def entrypoint():
                         for k, v in this_cumulative_param_set.items()
                         if k in this_sweep_config["parameters"]
                     }
-                    | {"username": config.wandb.prefix}
+                    | {"entity": config.wandb.prefix}
+                    | {"username": config.wandb.username}
                     | {"sweep_id": sweep_id}
                     | {"project_id": config.wandb.project_name}
                     | {"sweep_url": sweep_url}
@@ -504,7 +507,9 @@ def entrypoint():
             ):
                 partition_arg = partition_sequence[ix]
                 n_concurrent = config.gpu_partition_concurrency[partition_arg]
-                array_upper_bound = -(-n_seeds // n_concurrent)  # ceil(n_seeds / n_concurrent)
+                array_upper_bound = -(
+                    -n_seeds // n_concurrent
+                )  # ceil(n_seeds / n_concurrent)
                 training_commands = "\n".join(
                     f"{python_command} &" for _ in range(n_concurrent)
                 )
@@ -543,7 +548,11 @@ def entrypoint():
                 )
 
         else:
-            sweep_id = wandb.sweep(sweep_config, project=config.wandb.project_name)
+            sweep_id = wandb.sweep(
+                sweep_config,
+                entity=config.wandb.prefix,
+                project=config.wandb.project_name,
+            )
             # dump all the parameters of this sweep to stdout
             _logger.info(f"parameters of {sweep_id}:\n{yaml.dump(sweep_config)}")
             _logger.info(f"created sweep with id: {sweep_id} !")

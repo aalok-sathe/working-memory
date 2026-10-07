@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 import typing
+from urllib.parse import urlparse
 
 import pandas as pd
 from pandas.core.frame import DataFrame
@@ -13,6 +14,11 @@ import wandb
 import yaml
 
 import workingmem.utils.plotting as plotting
+
+
+# fallback entity/project for created-config files predating the entity/username
+# split in sweep_dict.yaml records (see `get_wandb_runs`).
+_LEGACY_DEFAULT_ENTITY_PROJECT = "zhaoziqigrad-brown-university/wm-mechanisms-1"
 
 
 logging.basicConfig(
@@ -123,7 +129,8 @@ def _get_partition_gpu_cap(partition_arg: str, user: str) -> int:
         "--noheader",
     ]
     max_tres_pu, grp_tres = (
-        subprocess.run(qos_cmd, capture_output=True, text=True, check=True)
+        subprocess
+        .run(qos_cmd, capture_output=True, text=True, check=True)
         .stdout.strip("|\n")
         .split("|")[:2]
     )
@@ -161,10 +168,10 @@ def _weighted_partition_sequence(
 
 @lru_cache(maxsize=None)
 def _get_wandb_runs(
-    project_name: str, sweep_id: str, prefix=wandbapi.viewer.username, samples=20_000
+    project_name: str, sweep_id: str, entity=wandbapi.viewer.entity, samples=20_000
 ) -> DataFrame:
     """
-    for a given workspace/user prefix and sweep ID retrieves all the runs corresponding
+    for a given wandb entity and sweep ID retrieves all the runs corresponding
     to that sweep. in this experimental framework each sweep should represent a single
     experimental condition. so every sweep is associated with identical metadata save for
     random seed in cases where models are randomly initialized, and the random shuffling
@@ -174,7 +181,7 @@ def _get_wandb_runs(
     """
     from workingmem import MainConfig, ModelConfig, SIRConfig, TrainingConfig
 
-    runs = wandbapi.sweep(f"{prefix}/{project_name}/{sweep_id}").runs
+    runs = wandbapi.sweep(f"{entity}/{project_name}/{sweep_id}").runs
     dfs = []
     for run in tqdm([*runs]):
         metrics: pd.DataFrame = run.history(pandas=True, samples=samples)
@@ -209,7 +216,7 @@ def _get_wandb_runs(
         except KeyError:
             # this run doesn't have enough data to have 'epoch' as a key; skip for now
             print(
-                f"\tkey `epoch` not found. skipping run: https://wandb.ai/{prefix}/{project_name}/runs/{run.name}"
+                f"\tkey `epoch` not found. skipping run: https://wandb.ai/{entity}/{project_name}/runs/{run.name}"
             )
             pass
 
@@ -225,7 +232,7 @@ def _get_wandb_runs(
 
 @typing.overload
 def get_wandb_runs(
-    project_name: str, sweep_id: str, prefix: str, samples: int
+    project_name: str, sweep_id: str, entity: str, samples: int
 ) -> DataFrame: ...
 
 
@@ -238,7 +245,7 @@ def get_wandb_runs(
 def get_wandb_runs(
     project_name: str = None,
     sweep_id: str = None,
-    prefix=wandbapi.viewer.username,
+    entity=wandbapi.viewer.entity,
     config_path: typing.Union[str, Path] = None,
     samples=10_000,
     download_steps: bool = False,
@@ -257,12 +264,24 @@ def get_wandb_runs(
         with Path(config_path).open("r") as f:
             created_config = yaml.load(f, yaml.FullLoader)
         for sweep in tqdm(created_config, desc="fetching sweeps from created config"):
-            # for each sweep obtain the workspace prefix and experiment name and sweep_id
+            # for each sweep obtain the wandb entity and experiment name and sweep_id
             # and fetch the runs co...rresponding to it
             project_name = sweep["project_id"]
             sweep_id = sweep["sweep_id"]
-            prefix = sweep["username"]
-            sweep_df = get_wandb_runs(project_name, sweep_id, prefix, samples=samples)
+            # `username` is a legacy field kept for reference only; `entity` is
+            # the field actually used to resolve the sweep. older created-config
+            # files predating the entity/username split default to the
+            # long-running team entity/project this codebase has mostly logged to.
+            username = sweep.get("username")
+            if "entity" in sweep:
+                entity = sweep["entity"]
+            elif "sweep_url" in sweep:
+                # e.g. https://wandb.ai/aloxatel/wm-mechanisms-1/sweeps/wqssdm00
+                # -> entity is the first path segment after the host.
+                entity = urlparse(sweep["sweep_url"]).path.strip("/").split("/")[0]
+            else:
+                entity, project_name = _LEGACY_DEFAULT_ENTITY_PROJECT.split("/")
+            sweep_df = get_wandb_runs(project_name, sweep_id, entity, samples=samples)
             try:
                 sweep_df_grouped_by_epoch = (
                     sweep_df.groupby(["epoch", "run_id"]).first().reset_index()
@@ -278,7 +297,7 @@ def get_wandb_runs(
             sweep_df_grouped_by_epoch.to_csv(dest / (sweep_id + "_epochs.csv"))
 
     else:
-        return _get_wandb_runs(project_name, sweep_id, prefix, samples=samples)
+        return _get_wandb_runs(project_name, sweep_id, entity, samples=samples)
 
 
 def _flatten_collection_of_tuples(
@@ -375,7 +394,7 @@ def annotate_trial_seq(
     as well as last _updating_ that role (i.e., St instruction). we also annotate the current trial's
     answer (same/diff) as well as whether the model got the prediction right (preds vs labels).
 
-    also includes `oracle_memory_state`, a json-serialized `{role: item}` snapshot of the ground-truth
+    also includes `oracle_memory_state_{start,end}`, a json-serialized `{role: item}` snapshot of the ground-truth
     memory contents as of the *end* of that trial (i.e., after applying this trial's update, if any) --
     this is the oracle/ground-truth state a model would need to track internally to solve the task,
     as opposed to `role`/`item`/`instr`, which describe only the current trial's own instruction.
@@ -388,7 +407,8 @@ def annotate_trial_seq(
     state = defaultdict(
         lambda: dict(time_since_access=-1, time_since_update=-1, num_accesses=0)
     )
-    oracle_memory: typing.Dict[str, str] = {}
+    oracle_memory_start: typing.Dict[str, str] = {}
+    oracle_memory_end: typing.Dict[str, str] = {}
     annotated_seq = []
     for i in range(0, len(trial_seq), 4):
         instr, role, item, ans = trial_seq[i : i + 4]
@@ -403,7 +423,9 @@ def annotate_trial_seq(
                 state[r]["time_since_update"] += 1
 
         if instr == "St":
-            oracle_memory[role] = item
+            # the oracle memory state that is accurate
+            # AS OF the END of the trial
+            oracle_memory_end[role] = item
 
         annotated_seq.append({
             "trial_ix": i // 4,
@@ -414,11 +436,19 @@ def annotate_trial_seq(
             "correct": int(preds[i // 4] == labels[i // 4]),
             "label": labels[i // 4],
             **state[role].copy(),
-            "oracle_memory_state": json.dumps(oracle_memory),
+            "oracle_memory_state_end": json.dumps(oracle_memory_end),
+            "oracle_memory_state_start": json.dumps(oracle_memory_start),
         })
         state[role]["time_since_access"] = 0
         if instr == "St":
             state[role]["time_since_update"] = 0
+
+        if instr == "St":
+            # the oracle memory state that is accurate
+            # AT THE BEGINNING of the trial but not at the end
+            # (it doesn't record the update, if any, from the current trial)
+            # it is accurate again at the beginning of the NEXT trial
+            oracle_memory_start[role] = item
 
     return pd.DataFrame(annotated_seq)
 

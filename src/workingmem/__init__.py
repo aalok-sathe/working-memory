@@ -63,7 +63,8 @@ class WandbConfig:
     from_config: typing.Union[str, None] = (
         None  # path to the config YAML file where an experimental setup is specified.
     )
-    prefix: str = wandbapi.viewer.username  # account prefix where your wandb sweeps are created. login to wandb.ai in a browser to find out!
+    prefix: str = wandbapi.viewer.entity  # wandb entity (personal username or team name) where your wandb sweeps are created. login to wandb.ai in a browser to find out!
+    username: str = wandbapi.viewer.username  # username
     download_runs: typing.Union[str, None] = (
         None  # path to a created config YAML file outputted by this
         # program as a result of the `create_sweep` and `from_config` flags.
@@ -113,23 +114,30 @@ class MainConfig:
         "gpu-he --account=carney-mjfrank-condo2",
     )
 
-    # NOTE (2026-09-29): number of concurrent wandb-agent/training processes to pack
-    # onto a single --gres=gpu:1 allocation, keyed by the exact partition string in
-    # gpu_partition_names. Static per-partition-class tier (not adaptive), from
-    # empirical nvidia-smi compute-utilization samples across running jobs:
+    # NOTE (2026-09-29, revised 2026-10-06): number of concurrent wandb-agent/
+    # training processes to pack onto a single --gres=gpu:1 allocation, keyed by
+    # the exact partition string in gpu_partition_names. Static per-partition-class
+    # tier (not adaptive).
     #   - 3090-gcondo (RTX 3090): 1 -- a single process already saturates GPU
     #     compute (~100%/41% util observed); packing more would only slow every
     #     co-located process down for no throughput gain.
-    #   - gpu-he/carney (mixed A6000/H100/Blackwell Pro 6000): 2 -- most sampled
-    #     nodes had real compute headroom (2-41% util from 1 job; H100 at 8%), kept
-    #     conservative rather than 3+ since we don't control which specific node/GPU
-    #     type we land on, and one Blackwell sample was already at 96% from 1 job
-    #     alone (even top-tier hardware isn't guaranteed headroom for this
-    #     compute-bound small-batch multicell-LSTM workload).
+    #   - gpu-he/carney (mixed A6000/H100/Blackwell Pro 6000): was 2 (nvidia-smi
+    #     showed 2-41% util from 1 job on most sampled nodes), reverted back to 1
+    #     on 2026-10-06 after measuring real impact on the multicell stress-test
+    #     sweep: without NVIDIA MPS, 2 processes sharing one GPU only get
+    #     driver-level time-slicing, not true parallelism -- per-epoch wall time
+    #     for num_lstm_cells=10 went from ~53min/epoch (unpacked baseline) to
+    #     ~87-88min/epoch (packed), a ~1.65x slowdown per process against a
+    #     ~2x nominal packing factor, i.e. only ~1.2x net aggregate throughput.
+    #     With multi-hour/multi-day runs now plausible on this workload and
+    #     `gpu-scavenger` (a preemptible partition) in the mix, the longer
+    #     per-job wall-clock time from packing increases exposure to eviction
+    #     more than the throughput gain is worth -- traded back for shorter
+    #     per-job runtime instead.
     gpu_partition_concurrency: dict = dataclasses.field(
         default_factory=lambda: {
             "3090-gcondo": 1,
-            "gpu-he --account=carney-mjfrank-condo2": 2,
+            "gpu-he --account=carney-mjfrank-condo2": 1,
         }
     )
 
