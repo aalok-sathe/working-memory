@@ -8,7 +8,7 @@
 #SBATCH -p {slurm_partition_argument} --gres=gpu:1
 
 #SBATCH -a 1-{array_upper_bound}%{array_upper_bound}
-#SBATCH -t 1-01:00:00
+#SBATCH -t 1-12:00:00
 
 #SBATCH -o {batch_output_prefix}batch-output/training_run_%A_%a.out
 #SBATCH --nodes=1

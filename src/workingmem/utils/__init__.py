@@ -265,23 +265,49 @@ def get_wandb_runs(
             created_config = yaml.load(f, yaml.FullLoader)
         for sweep in tqdm(created_config, desc="fetching sweeps from created config"):
             # for each sweep obtain the wandb entity and experiment name and sweep_id
-            # and fetch the runs co...rresponding to it
-            project_name = sweep["project_id"]
+            # and fetch the runs corresponding to it
             sweep_id = sweep["sweep_id"]
-            # `username` is a legacy field kept for reference only; `entity` is
-            # the field actually used to resolve the sweep. older created-config
-            # files predating the entity/username split default to the
-            # long-running team entity/project this codebase has mostly logged to.
-            username = sweep.get("username")
+
+            # pre-entity-field created-config files can have an `entity`,
+            # `username`, and/or `sweep_url`-derived entity that each claim a
+            # DIFFERENT account -- e.g. a sweep created before `entity=` was
+            # passed explicitly to `wandb.sweep()` can land under an account
+            # that matches none of these fields, since they were populated
+            # from config values that weren't actually used at creation time.
+            # Rather than trusting whichever field happens to be present
+            # first and failing hard if it's wrong, try every candidate
+            # against the real wandb API, in order, and only skip the sweep
+            # if every single one fails to resolve.
+            candidates = []  # list of (entity, project_name), tried in order
             if "entity" in sweep:
-                entity = sweep["entity"]
-            elif "sweep_url" in sweep:
+                candidates.append((sweep["entity"], sweep["project_id"]))
+            if sweep.get("username"):
+                candidates.append((sweep["username"], sweep["project_id"]))
+            if "sweep_url" in sweep:
                 # e.g. https://wandb.ai/aloxatel/wm-mechanisms-1/sweeps/wqssdm00
                 # -> entity is the first path segment after the host.
-                entity = urlparse(sweep["sweep_url"]).path.strip("/").split("/")[0]
-            else:
-                entity, project_name = _LEGACY_DEFAULT_ENTITY_PROJECT.split("/")
-            sweep_df = get_wandb_runs(project_name, sweep_id, entity, samples=samples)
+                url_entity = urlparse(sweep["sweep_url"]).path.strip("/").split("/")[0]
+                candidates.append((url_entity, sweep["project_id"]))
+            candidates.append(tuple(_LEGACY_DEFAULT_ENTITY_PROJECT.split("/")))
+            # dedupe while preserving priority order (a `username` that
+            # happens to match `entity`, say, shouldn't be retried twice).
+            seen = set()
+            candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+
+            sweep_df = None
+            for entity, project_name in candidates:
+                try:
+                    sweep_df = get_wandb_runs(project_name, sweep_id, entity, samples=samples)
+                    break
+                except wandb.errors.CommError:
+                    continue
+            if sweep_df is None:
+                _logger.warning(
+                    f"could not resolve sweep {sweep_id!r} under any candidate "
+                    f"entity {[c[0] for c in candidates]} -- skipping"
+                )
+                continue
+
             try:
                 sweep_df_grouped_by_epoch = (
                     sweep_df.groupby(["epoch", "run_id"]).first().reset_index()
