@@ -7,6 +7,7 @@ from pathlib import Path
 import typing
 from urllib.parse import urlparse
 
+import numpy as np
 import pandas as pd
 from pandas.core.frame import DataFrame
 from tqdm.auto import tqdm
@@ -324,6 +325,45 @@ def get_wandb_runs(
 
     else:
         return _get_wandb_runs(project_name, sweep_id, entity, samples=samples)
+
+
+def simulate_matched_dirichlet(
+    k: int, lower_k: int, m: int, alpha: float = 1.0, size: int | None = None
+) -> np.ndarray:
+    """
+    draws a `k`-dim `Dirichlet(alpha,...,alpha)` vector whose first `m`
+    coordinates are JOINTLY the first `m` coordinates of one SEPARATE
+    `lower_k`-dim `Dirichlet(alpha,...,alpha)` draw (`lower_k >= m`), and
+    whose remaining `k - m` coordinates are an independent symmetric
+    `(k - m)`-dim Dirichlet draw renormalized to the leftover mass.
+
+    this is statistically exact, not an approximation: by the Dirichlet
+    "neutrality"/aggregation property, any subset of `m` coordinates of a
+    symmetric Dirichlet draw retains the correct JOINT law on its own, and
+    the renormalized remainder is independent of it. taking the `m` matched
+    coordinates together (rather than `m` independent single-coordinate
+    draws) is what preserves correct co-occurrence statistics when `m > 1`.
+
+    `m=0` reduces to a plain `k`-dim symmetric Dirichlet draw. `size`, like
+    `numpy.random.dirichlet`'s own `size` param: `None` returns a single
+    `(k,)` draw, an int returns `(size, k)` draws.
+    """
+    _n = size or 1
+    probs = np.zeros((_n, k))
+    if m > 0:
+        matched = np.random.dirichlet(np.full(lower_k, alpha), size=_n)[:, :m]
+        probs[:, :m] = matched
+        # when m == lower_k, the matched columns are the WHOLE lower_k-dim
+        # draw and should sum to exactly 1, leaving exactly 0 leftover -- but
+        # floating-point error can make this slightly negative, which
+        # np.random.choice's p= strictly rejects downstream. clip at 0.
+        leftover_mass = np.clip(1 - matched.sum(axis=1, keepdims=True), 0, None)
+    else:
+        leftover_mass = np.ones((_n, 1))
+    if k - m > 0:
+        rest = np.random.dirichlet(np.full(k - m, alpha), size=_n)
+        probs[:, m:] = rest * leftover_mass
+    return probs if size is not None else probs[0]
 
 
 def _flatten_collection_of_tuples(

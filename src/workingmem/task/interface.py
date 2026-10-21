@@ -73,6 +73,15 @@ class GeneratedCachedDataset(ABC, torch.utils.data.Dataset):
     # safe to (re)generate the dataset ourselves rather than waiting forever.
     _generation_lock_stale_seconds = 15 * 60
     _generation_lock_filename = ".generating_since"
+    # a field name -> "off" default value mapping: a field listed here is
+    # dropped from the hash input entirely when its value equals that
+    # default, so adding a new config field doesn't change the hash/cache
+    # directory of every PRE-EXISTING dataset config that never touches it
+    # (it would otherwise, since `_metadata()` includes every dataclass
+    # field unconditionally). only field names explicitly listed here get
+    # this treatment -- every other field keeps participating in the hash
+    # unconditionally, exactly as before, regardless of its current value.
+    _hash_omit_if_default: typing.Mapping[str, typing.Any] = {}
     config: GeneratedCachedDatasetConfig
     label_mask: torch.Tensor = None
     tokenizer: tokenizers.Tokenizer
@@ -265,6 +274,9 @@ class GeneratedCachedDataset(ABC, torch.utils.data.Dataset):
                 # "local_split_set_control",
             )
             # and v is not None  # breaking change
+            and not (
+                k in self._hash_omit_if_default and v == self._hash_omit_if_default[k]
+            )
         ])
         H = sha1(attr_str.encode()).hexdigest()[: self._hash_length].upper()
         return attr_str, H
