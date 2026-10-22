@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import typing
 from abc import ABC, abstractmethod
@@ -244,10 +245,23 @@ class GeneratedCachedDataset(ABC, torch.utils.data.Dataset):
                 f"writing {len(data[split])} trials to {self.config.basedir}/{split}"
             )
             split_path = self.config.basedir / f"{split}.json"
-            with split_path.open("w") as f:
+            # write-then-atomic-rename: `split_path.exists()` is how other
+            # processes (and this class's own __init__) detect "generation
+            # is done" -- `open(split_path, "w")` would make that true
+            # instantly, well before a large (e.g. 100k-example) json.dump
+            # finishes writing, letting a waiting reader see/parse a
+            # truncated file. writing to a same-directory temp file first and
+            # only renaming (atomic on POSIX) once writing is complete and
+            # flushed means split_path never exists in a partially-written
+            # state.
+            tmp_path = self.config.basedir / f"{split}.json.tmp"
+            with tmp_path.open("w") as f:
                 # with gzip.open(split_path, "wt", encoding="utf-8") as f:
                 # yaml.dump(data.tolist(), f, Dumper=yaml.SafeDumper, width=float("inf"))
                 json.dump(data[split], f, cls=NumpyEncoder)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(split_path)
 
     def __len__(self):
         assert getattr(self.config, f"n_{self.config.split}") == len(self.data), (
