@@ -22,6 +22,7 @@ from workingmem.task.interface import (
     GeneratedCachedDatasetConfig,
     SupportsGetitem,
 )
+from workingmem.utils import simulate_matched_dirichlet
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -118,6 +119,33 @@ class SIRConfig(GeneratedCachedDatasetConfig):
     to a dirichlet distribution with alphas=1 (concurrent_roles-dimensional).
     this approximates a uniform distribution over each role while maintaining a
     simplex constraint over probabilities of individual roles.
+    """
+
+    match_lower_set_size_statistic: typing.Union[int, None] = None
+    """
+    when set (and `dirichlet_priors` is also True), a small fixed pool of
+    registers (see `match_lower_set_size_pool_fraction`) are granted,
+    whenever 1-2 of them land in a trial sequence's chosen registers, a
+    per-trial selection-probability prior matched to what they would have in
+    a *smaller* task of this many concurrent registers (must be <
+    `concurrent_reg`). isolates the effect of "effective set size"/
+    inter-trial wait-time statistics for a role from overall task difficulty
+    (held fixed via `concurrent_reg`/`n_reg`). None (default) disables this
+    control condition entirely and reproduces current behavior exactly.
+    requires `dirichlet_priors=True` to have any effect; does NOT imply it.
+    """
+
+    match_lower_set_size_pool_fraction: float = 0.05
+    """
+    fraction of n_reg (rounded, floored at 2) forming the FIXED, deterministic
+    pool of registers eligible for `match_lower_set_size_statistic` treatment.
+    the pool is always the numeric block range(pool_size) -- registers
+    0..pool_size-1 -- never a randomly reshuffled subset, so it's trivially
+    documentable from config alone. only consulted when
+    `match_lower_set_size_statistic` is not None. the register-inclusion
+    sampling weight used to compensate pool registers' overall token-count
+    share (see `_set_size_control_setup`) is a closed-form approximation,
+    not exact -- see that method's docstring.
     """
 
     n_train: int = 100_000
@@ -219,6 +247,13 @@ class SIRDataset(GeneratedCachedDataset):
     trial_label_mask: tuple = (0, 0, 0, 1)
     # use_bos_token: bool = True # alternatively, we just suck it up and handle the offset on the model side
     config_class = SIRConfig
+    # see GeneratedCachedDataset._hash_omit_if_default: keeps these two new
+    # fields from changing the hash/cache dir of every pre-existing SIRConfig
+    # that doesn't touch match_lower_set_size_statistic.
+    _hash_omit_if_default = {
+        "match_lower_set_size_statistic": None,
+        "match_lower_set_size_pool_fraction": 0.05,
+    }
 
     def __init__(
         self,
@@ -247,6 +282,13 @@ class SIRDataset(GeneratedCachedDataset):
 
         if config.n_back is None and config.concurrent_reg is not None:
             config.n_back = config.concurrent_reg
+
+        # must run before super().__init__, which triggers generate() (and
+        # hence generate_trial_sequence, which needs _reg_sampling_weights/
+        # _set_size_pool already set) immediately if no cache exists on disk.
+        self.config = config
+        if config.match_lower_set_size_statistic is not None:
+            self._set_size_control_setup()
 
         super().__init__(config)
         self.tokenizer = tokenizer or SIRTokenizer.from_params(
@@ -279,6 +321,48 @@ class SIRDataset(GeneratedCachedDataset):
 
     def _statistics_aligned_setup(self, how_many=0.3):
         """ """
+
+    def _set_size_control_setup(self):
+        """
+        one-time (per dataset instance), deterministic setup for the
+        `match_lower_set_size_statistic` control condition: fixes the
+        special-register pool (always the numeric block
+        `range(pool_size)`) and precomputes the register-inclusion sampling
+        weights used at the `regs_chosen` step in `generate_trial_sequence`
+        to compensate for pool registers' boosted per-trial share once
+        selected (see that config field's docstring for the motivation).
+
+        the compensation weight (`L/K` for pool registers, `1` otherwise) is
+        a closed-form approximation, not exact: weighted sampling without
+        replacement induces small negative inclusion correlations, and
+        non-pool registers' share is slightly below `1/K` in sequences that
+        do contain pool registers. both effects are second-order under
+        typical configs (small pool fraction, modest concurrent_reg). verify
+        empirically (e.g. Counter() over `reg_<i>` tokens in a generated
+        dataset) rather than trusting this formula outright.
+        """
+        cfg = self.config
+        assert cfg.match_lower_set_size_statistic < cfg.concurrent_reg, (
+            "match_lower_set_size_statistic must be strictly less than concurrent_reg"
+        )
+        assert cfg.locality is None, (
+            "match_lower_set_size_statistic's compensation weighting assumes "
+            "the full register range is the regs_chosen candidate pool; "
+            "locality (which restricts that pool per-sequence) is not "
+            "supported in combination with this feature"
+        )
+
+        self._set_size_pool_size = max(
+            2, round(cfg.match_lower_set_size_pool_fraction * cfg.n_reg)
+        )
+        self._set_size_pool = frozenset(range(self._set_size_pool_size))
+
+        K, L = cfg.concurrent_reg, cfg.match_lower_set_size_statistic
+        n_candidates = cfg.n_reg - cfg.heldout_reg
+        weights = np.array([
+            L / K if i in self._set_size_pool else 1.0 for i in range(n_candidates)
+        ])
+        self._reg_sampling_weights = weights / weights.sum()
 
     def __getitem__(
         self, idx: int
@@ -411,15 +495,56 @@ class SIRDataset(GeneratedCachedDataset):
         # regs_chosen now contains the indexes of the registers to use.
         # when n_reg == concurrent_reg, this just makes
         # regs_chosen == reg_range
+        # when match_lower_set_size_statistic is active, downweight pool
+        # registers' inclusion odds (see _set_size_control_setup) to
+        # compensate for the boosted per-trial share they'll get once
+        # selected -- reg_range is a (rotated) permutation of the full
+        # candidate index range, so reindex the weights by reg_range's
+        # actual register identities rather than assuming identity order.
+        reg_sampling_weights = (
+            self._reg_sampling_weights[reg_range]
+            if self.config.match_lower_set_size_statistic is not None
+            else None
+        )
         regs_chosen: np.ndarray[int] = np.random.choice(
-            reg_range, self.config.concurrent_reg, replace=False
+            reg_range, self.config.concurrent_reg, replace=False, p=reg_sampling_weights
         ).astype(int)
 
         # fix this at trial sequence level!
         # NOTE: index with [0] rather than .squeeze() -- squeeze() would also
         # collapse the roles axis itself when concurrent_reg == 1, leaving a
         # 0-d scalar that np.random.choice(..., p=...) can't consume.
-        prior_over_roles = np.random.dirichlet(np.ones(len(regs_chosen)), size=1)[0]
+        #
+        # if match_lower_set_size_statistic is active, up to 2 "pool"
+        # registers (the fixed block range(pool_size), see
+        # _set_size_control_setup) may have landed in regs_chosen -- if so,
+        # their share of prior_over_roles is drawn jointly from a SEPARATE,
+        # smaller Dirichlet (matching the wait-time statistics of a task
+        # with only match_lower_set_size_statistic concurrent registers),
+        # while the remaining registers keep standard concurrent_reg-way
+        # statistics. more than 2 pool registers co-occurring is rejected
+        # and the whole trial sequence is resampled by _generate_split's
+        # existing retry loop (it already catches ValueError).
+        set_size_pool = getattr(self, "_set_size_pool", frozenset())
+        pool_mask = np.array([r in set_size_pool for r in regs_chosen])
+        m = int(pool_mask.sum())
+        if m > 2:
+            raise ValueError(
+                f"more than 2 match_lower_set_size_statistic pool registers "
+                f"co-occurred in regs_chosen ({m}); resampling"
+            )
+
+        if self.config.dirichlet_priors and self.config.match_lower_set_size_statistic is not None:
+            draw = simulate_matched_dirichlet(
+                k=len(regs_chosen),
+                lower_k=self.config.match_lower_set_size_statistic,
+                m=m,
+            )
+            prior_over_roles = np.empty(len(regs_chosen))
+            prior_over_roles[np.flatnonzero(pool_mask)] = draw[:m]
+            prior_over_roles[np.flatnonzero(~pool_mask)] = draw[m:]
+        else:
+            prior_over_roles = np.random.dirichlet(np.ones(len(regs_chosen)), size=1)[0]
 
         register_item_pool = {}
         # typically, we'll be using split-set control when n_reg = 2 and
@@ -751,6 +876,15 @@ class SIRDataset(GeneratedCachedDataset):
                 for r in regs_chosen
             ),
             "mode": mode or "none",
+            **(
+                {
+                    "set_size_pool_members": tuple(
+                        int(r) for r in regs_chosen if r in self._set_size_pool
+                    )
+                }
+                if self.config.match_lower_set_size_statistic is not None
+                else {}
+            ),
         }
 
     @property
