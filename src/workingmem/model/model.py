@@ -4,6 +4,7 @@ from typing_extensions import Self
 
 
 import dataclasses
+import math
 import typing
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -557,6 +558,26 @@ class ModelWrapper(ABC):
                     _logger.warning(
                         f"best validation accuracy {state.best_val_acc:.3f} reached, skipping training loop to directly evaluate the model"
                     )
+                elif training_config.credit_assignment_mode == "eligibility":
+                    # AMP/GradScaler is intentionally skipped in this mode: the
+                    # substitute gate gradients are precomputed values injected via
+                    # tensor hooks, never actually produced by backprop-ing the
+                    # (scaled) loss -- GradScaler's uniform unscale step would
+                    # divide them by a scale factor they were never multiplied by,
+                    # silently corrupting their magnitude. Plain fp32 backward/step
+                    # sidesteps that mismatch entirely.
+                    torch.cuda.empty_cache()
+                    loss = self._step(
+                        inputs,
+                        sparsity=training_config.sparsity,
+                        mask_answer_tokens=training_config.mask_answer_tokens,
+                        credit_assignment_mode=training_config.credit_assignment_mode,
+                        credit_assignment_decay=training_config.credit_assignment_decay,
+                        credit_assignment_scale=training_config.credit_assignment_scale,
+                    )
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
                 else:
                     torch.cuda.empty_cache()
                     with torch.amp.autocast(
@@ -865,12 +886,39 @@ class ModelWrapper(ABC):
             "macro_acc": float(eval_num_correct / len(actual_labels)),
         }
 
+    def _begin_eligibility_tracking(self, decay: float):
+        """
+        Override in subclasses that support `credit_assignment_mode="eligibility"`
+        (currently only `LSTMMultiCellWrapper`). Should construct an
+        `EligibilityRecorder`, wire it into the model so the upcoming forward call
+        registers gate-gradient-substitution hooks, and return it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support "
+            "credit_assignment_mode='eligibility' (only LSTMMultiCellWrapper does)"
+        )
+
+    def _populate_eligibility_substitutes(self, recorder, outputs, inputs, scale):
+        """
+        Override alongside `_begin_eligibility_tracking`. Should compute the
+        per-timestep reward signal from `outputs`/`inputs` and call
+        `recorder.compute_and_populate_substitutes(...)`, before `.backward()` is
+        called on the returned loss.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support "
+            "credit_assignment_mode='eligibility' (only LSTMMultiCellWrapper does)"
+        )
+
     def _step(
         self,
         inputs: typing.Dict[str, torch.Tensor],
         sparsity: float = 0.0,
         return_outputs=False,
         mask_answer_tokens=True,
+        credit_assignment_mode: str = "backprop",
+        credit_assignment_decay: float = 0.9,
+        credit_assignment_scale: float = 1.0,
     ) -> (
         torch.Tensor
         | typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -878,6 +926,12 @@ class ModelWrapper(ABC):
         """
         this method is responsible for computing the loss and optionally the labels
         batch of a batch of inputs
+
+        `credit_assignment_mode="eligibility"` (only supported by
+        `LSTMMultiCellWrapper`) substitutes the `i`/`f`/`o` gate gradients with an
+        eligibility-trace-based signal instead of the true backprop gradient; see
+        `EligibilityRecorder`. Left at the default `"backprop"`, behavior here is
+        unchanged from before this mode existed.
         """
 
         inputs["token_ids"] = inputs["token_ids"].to(self.device)
@@ -902,12 +956,21 @@ class ModelWrapper(ABC):
                 f"\tAFTER removing answer tokens from input: {inputs['token_ids'].gt(0).sum() = }"
             )
 
+        eligibility_recorder = None
+        if credit_assignment_mode == "eligibility":
+            eligibility_recorder = self._begin_eligibility_tracking(
+                decay=credit_assignment_decay
+            )
+
         # shape of logits: (b, seq_len, |V|)
         logits = self.forward(inputs["token_ids"])
 
-        if return_outputs:
+        # eligibility mode needs `gathered_answers`/`gathered_labels`/
+        # `sparsity_mask` regardless of `return_outputs`, to compute the
+        # per-position reward signal before `.backward()` is called
+        if return_outputs or eligibility_recorder is not None:
             outputs = compute_masked_loss(
-                logits, inputs, sparsity=sparsity, return_outputs=return_outputs
+                logits, inputs, sparsity=sparsity, return_outputs=True
             )
             loss, gathered_logits, gathered_answers, gathered_labels = (
                 outputs["loss"],
@@ -915,6 +978,14 @@ class ModelWrapper(ABC):
                 outputs["gathered_answers"],
                 outputs["gathered_labels"],
             )
+
+            if eligibility_recorder is not None:
+                self._populate_eligibility_substitutes(
+                    eligibility_recorder,
+                    outputs=outputs,
+                    inputs=inputs,
+                    scale=credit_assignment_scale,
+                )
 
             _logger.debug(f"{loss.shape = }, {inputs['token_ids'].shape = }")
             _logger.debug(
@@ -924,7 +995,9 @@ class ModelWrapper(ABC):
                 f"{gathered_logits.shape = }, {gathered_answers.shape = }, {gathered_labels.shape = }"
             )
 
-            return loss, gathered_logits, gathered_answers, gathered_labels
+            if return_outputs:
+                return loss, gathered_logits, gathered_answers, gathered_labels
+            return loss
         else:
             loss = compute_masked_loss(
                 logits, inputs, sparsity=sparsity, return_outputs=return_outputs
@@ -1332,6 +1405,79 @@ class TransformerModelWrapper(ModelWrapper):
         raise NotImplementedError
 
 
+class EligibilityGatedLSTMCell(torch.nn.Module):
+    """
+    A from-scratch reimplementation of `torch.nn.LSTMCell`'s forward math (same
+    parameter layout/initialization and numerics), rewritten so the `i`/`f`/`o`
+    gate pre-activations are addressable intermediate tensors.
+
+    This is what lets `credit_assignment_mode="eligibility"` intercept and
+    substitute their gradients via `tensor.register_hook` -- `torch.nn.LSTMCell`'s
+    fused kernel exposes no such hook point. With no `eligibility_recorder` passed
+    (the default), this cell is numerically identical to `torch.nn.LSTMCell`.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.weight_ih = torch.nn.Parameter(torch.empty(4 * hidden_size, input_size))
+        self.weight_hh = torch.nn.Parameter(torch.empty(4 * hidden_size, hidden_size))
+        self.bias_ih = torch.nn.Parameter(torch.empty(4 * hidden_size))
+        self.bias_hh = torch.nn.Parameter(torch.empty(4 * hidden_size))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # matches `torch.nn.modules.rnn.RNNCellBase.reset_parameters`
+        stdv = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0
+        for weight in self.parameters():
+            torch.nn.init.uniform_(weight, -stdv, stdv)
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        hx: typing.Tuple[torch.Tensor, torch.Tensor],
+        eligibility_recorder=None,
+        layer_idx: int = None,
+        cell_idx: int = None,
+        t: int = None,
+    ):
+        h_prev, c_prev = hx
+        gates = (
+            input @ self.weight_ih.t()
+            + self.bias_ih
+            + h_prev @ self.weight_hh.t()
+            + self.bias_hh
+        )
+        # PyTorch's LSTMCell gate order: input, forget, cell(candidate), output
+        i_preact, f_preact, g_preact, o_preact = gates.chunk(4, dim=1)
+
+        if eligibility_recorder is not None and i_preact.requires_grad:
+            for gate_name, preact in (
+                ("i", i_preact),
+                ("f", f_preact),
+                ("o", o_preact),
+            ):
+                preact.register_hook(
+                    eligibility_recorder.hook_factory(layer_idx, cell_idx, t, gate_name)
+                )
+
+        i = torch.sigmoid(i_preact)
+        f = torch.sigmoid(f_preact)
+        g = torch.tanh(g_preact)
+        o = torch.sigmoid(o_preact)
+
+        if eligibility_recorder is not None:
+            for gate_name, activation in (("i", i), ("f", f), ("o", o)):
+                eligibility_recorder.record_activation(
+                    layer_idx, cell_idx, t, gate_name, activation
+                )
+
+        c = f * c_prev + i * g
+        h = o * torch.tanh(c)
+        return h, c
+
+
 class LSTMMultiCell(torch.nn.Module):
     """
     Independent parallel LSTM cells that process input simultaneously.
@@ -1368,7 +1514,7 @@ class LSTMMultiCell(torch.nn.Module):
         ), f"Unknown merge strategy: {merge_strategy}"
 
         self.cells = torch.nn.ModuleList([
-            torch.nn.modules.rnn.LSTMCell(input_size, hidden_size)
+            EligibilityGatedLSTMCell(input_size, hidden_size)
             for _ in range(num_cells)
         ])
 
@@ -1376,7 +1522,12 @@ class LSTMMultiCell(torch.nn.Module):
             self.merge_weights = torch.nn.Parameter(torch.ones(num_cells))
 
     def forward(
-        self, input: torch.Tensor, hx: typing.Union[list, None] = None
+        self,
+        input: torch.Tensor,
+        hx: typing.Union[list, None] = None,
+        eligibility_recorder=None,
+        layer_idx: int = None,
+        t: int = None,
     ) -> tuple:
         """
         Args:
@@ -1387,6 +1538,9 @@ class LSTMMultiCell(torch.nn.Module):
                 callers that want to carry state across successive calls (e.g. to
                 process a sequence one timestep at a time) must feed back the
                 `cell_hx` list this method returns, not the merged state.
+            eligibility_recorder, layer_idx, t: only used when
+                `credit_assignment_mode="eligibility"` (see `EligibilityRecorder`);
+                `None`/unused otherwise, with zero effect on forward numerics.
 
         Returns:
             output: Merged output tensor
@@ -1421,7 +1575,14 @@ class LSTMMultiCell(torch.nn.Module):
 
         cell_outputs = []
         for cell_idx, cell in enumerate(self.cells):
-            h_t, c_t = cell(x_t, hx[cell_idx])
+            h_t, c_t = cell(
+                x_t,
+                hx[cell_idx],
+                eligibility_recorder=eligibility_recorder,
+                layer_idx=layer_idx,
+                cell_idx=cell_idx,
+                t=t,
+            )
             cell_outputs.append(h_t)
             hx[cell_idx] = (h_t, c_t)
 
@@ -1507,6 +1668,14 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
             ):
                 super().__init__()
                 self.num_layers = num_layers
+                # set externally (by `LSTMMultiCellWrapper._begin_eligibility_tracking`)
+                # right before a forward call when
+                # `credit_assignment_mode="eligibility"`; `None` otherwise, with zero
+                # effect on forward numerics. Threaded through as a plain attribute
+                # (rather than a forward kwarg) since this module is called via
+                # `torch.nn.Sequential`, which only forwards a single positional arg
+                # between submodules.
+                self.eligibility_recorder = None
                 layer_output_size = (
                     hidden_size * num_cells
                     if merge_strategy == "concatenate"
@@ -1552,7 +1721,11 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
                         # (h, c) states), so recurrence is carried per-cell across
                         # timesteps.
                         output_t, (h_t, c_t), hx[layer_idx] = layer(
-                            layer_input, hx[layer_idx]
+                            layer_input,
+                            hx[layer_idx],
+                            eligibility_recorder=self.eligibility_recorder,
+                            layer_idx=layer_idx,
+                            t=t,
                         )
                         # `output_t` carries an artificial seq-dim of size 1 (see
                         # `LSTMMultiCell.forward`/`_merge_outputs`); squeeze it
@@ -1680,6 +1853,50 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
             }
 
             return self._unbatch_result(result, was_unbatched)
+
+    def _begin_eligibility_tracking(self, decay: float):
+        """
+        See `ModelWrapper._begin_eligibility_tracking`. Constructs an
+        `EligibilityRecorder` and attaches it to the `lstm` submodule so that the
+        upcoming forward call's `i`/`f`/`o` gate pre-activations register
+        gradient-substitution hooks (see `EligibilityGatedLSTMCell.forward`).
+        """
+        from workingmem.model.eligibility import EligibilityRecorder
+
+        recorder = EligibilityRecorder(
+            num_layers=self.config.n_layers,
+            num_cells=self.config.num_lstm_cells,
+            decay=decay,
+        )
+        self.model.lstm.eligibility_recorder = recorder
+        return recorder
+
+    def _populate_eligibility_substitutes(self, recorder, outputs, inputs, scale):
+        """
+        See `ModelWrapper._populate_eligibility_substitutes`. Builds a
+        per-timestep reward signal (+1 correct / -1 incorrect at each answer
+        position, 0 elsewhere) from this step's predictions, respecting the same
+        `sparsity` masking `compute_masked_loss` already applied to the loss (so
+        `credit_assignment_mode="eligibility"` composes with `sparsity` the same
+        way ordinary backprop does), then hands it to the recorder to compute and
+        fill in the substitute gradients before `.backward()` is called.
+        """
+        b, seq_len = inputs["token_ids"].shape
+        answer_positions = inputs["answer_locations"][0].nonzero(as_tuple=True)[0]
+
+        correct = (outputs["gathered_answers"] == outputs["gathered_labels"]).float()
+        sparsity_mask = outputs["sparsity_mask"].float()
+        reward_at_answers = (correct * 2 - 1) * sparsity_mask
+
+        rewards = torch.zeros(
+            b, seq_len, device=inputs["token_ids"].device, dtype=torch.float32
+        )
+        rewards[:, answer_positions] = reward_at_answers
+
+        recorder.compute_and_populate_substitutes(rewards, scale=scale)
+        # detach the recorder so it doesn't leak into a later, unrelated forward
+        # call (e.g. an eval pass immediately following this training step)
+        self.model.lstm.eligibility_recorder = None
 
 
 class RIMModelWrapper(ModelWrapper):
