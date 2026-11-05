@@ -32,6 +32,7 @@ from workingmem.model.interface import (
     ModelConfig,
     # TransformerConfig,
     # RNNConfig,
+    compute_cell_competition_loss,
     compute_masked_loss,
 )
 
@@ -565,6 +566,7 @@ class ModelWrapper(ABC):
                         loss = self._step(
                             inputs,
                             sparsity=training_config.sparsity,
+                            competition_reg_coef=training_config.competition_reg_coef,
                             mask_answer_tokens=training_config.mask_answer_tokens,
                         )
 
@@ -865,10 +867,25 @@ class ModelWrapper(ABC):
             "macro_acc": float(eval_num_correct / len(actual_labels)),
         }
 
+    def _forward_with_regularization(
+        self, token_ids: torch.Tensor, competition_reg_coef: float
+    ) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns (logits, regularization_loss). Default implementation ignores
+        `competition_reg_coef` (ModelWrapper subclasses other than
+        `LSTMMultiCellWrapper` don't yet have a regularization term to add)
+        and computes logits via the ordinary single-forward-pass path, so
+        this is a zero-cost no-op unless overridden. `regularization_loss` is
+        a 0.0 scalar tensor on `self.device`, safe to unconditionally add to
+        the task loss.
+        """
+        return self.forward(token_ids), torch.tensor(0.0, device=self.device)
+
     def _step(
         self,
         inputs: typing.Dict[str, torch.Tensor],
         sparsity: float = 0.0,
+        competition_reg_coef: float = 0.0,
         return_outputs=False,
         mask_answer_tokens=True,
     ) -> (
@@ -903,14 +920,16 @@ class ModelWrapper(ABC):
             )
 
         # shape of logits: (b, seq_len, |V|)
-        logits = self.forward(inputs["token_ids"])
+        logits, regularization_loss = self._forward_with_regularization(
+            inputs["token_ids"], competition_reg_coef
+        )
 
         if return_outputs:
             outputs = compute_masked_loss(
                 logits, inputs, sparsity=sparsity, return_outputs=return_outputs
             )
             loss, gathered_logits, gathered_answers, gathered_labels = (
-                outputs["loss"],
+                outputs["loss"] + regularization_loss,
                 outputs["gathered_logits"],
                 outputs["gathered_answers"],
                 outputs["gathered_labels"],
@@ -929,7 +948,7 @@ class ModelWrapper(ABC):
             loss = compute_masked_loss(
                 logits, inputs, sparsity=sparsity, return_outputs=return_outputs
             )
-            return loss
+            return loss + regularization_loss
 
     def __call__(self, *args, return_hidden_states=False, **kwargs):
         # allow callers to pass a single unbatched sequence (shape (seq_len,))
@@ -1479,6 +1498,34 @@ class LSTMMultiCellWrapper(RNNModelWrapper):
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
+
+    def _forward_with_regularization(
+        self, token_ids: torch.Tensor, competition_reg_coef: float
+    ) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+        """
+        When `competition_reg_coef` is 0 (the default), falls back to the
+        ordinary cheap single-forward-pass path (no per-cell states are even
+        computed). Otherwise, runs embed -> lstm -> unembed manually (instead
+        of via `self.forward`/`self.model`) so the per-cell hidden states
+        needed for `compute_cell_competition_loss` come from the SAME forward
+        pass that produces the logits, rather than a second, wasted one.
+        """
+        if not competition_reg_coef:
+            return super()._forward_with_regularization(token_ids, competition_reg_coef)
+
+        embed = self.model.embed
+        unembed = self.model.unembed
+        lstm_block = self.model.lstm
+
+        embeddings = embed(token_ids)
+        seq_out, _, (percell_h, _) = lstm_block(
+            embeddings, return_hidden_states=True, return_percell_states=True
+        )
+        logits = unembed(seq_out)
+        regularization_loss = competition_reg_coef * compute_cell_competition_loss(
+            percell_h
+        )
+        return logits, regularization_loss
 
     @classmethod
     def _get_nn_sequential_block_labels(
