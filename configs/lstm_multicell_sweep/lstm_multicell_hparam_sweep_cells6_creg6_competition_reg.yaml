@@ -1,0 +1,107 @@
+# First check of the new `trainer.competition_reg_coef` cell-competition
+# regularizer (see `compute_cell_competition_loss` in
+# src/workingmem/model/interface.py, added on this branch,
+# feature-multicell-competition-reg) -- a soft winner-take-all / global-
+# inhibition penalty on the multicell LSTM's per-cell hidden states:
+# coef * mean entropy of softmax(per-cell hidden-state norms). coef=0.0
+# (the default everywhere else) recovers the exact prior behavior.
+#
+# Run at the SAME fixed operating point (num_lstm_cells=6, concurrent_reg=6,
+# d_hidden=200) used by the two prior hparam due-diligence sweeps in the main
+# repo (learning_rate, then weight_decay) -- see
+# experiments/lstm_multicell_sweep/hparam_ranking_cells6_creg6_2layer_marimo.py
+# and hparam_ranking_cells6_creg6_weight_decay_marimo.py there -- so this
+# sweep's accuracy numbers are directly comparable to the already-established
+# baseline (mean eval_acc ~0.969 for n_layers=1, ~0.981 for n_layers=2 at
+# coef=0.0) without re-deriving tuned learning rates: n_layers=1 uses 1e-3,
+# n_layers=2 uses 0.0021, exactly as before, via conditional_variables.
+#
+# Both n_layers values are crossed against competition_reg_coef so we can
+# check NECESSITY (does forcing competition help or hurt accuracy relative
+# to the coef=0.0 baseline -- i.e. is low cell-entropy necessary/beneficial
+# for the task) vs. SUFFICIENCY/side-effects (does a strong competition
+# pressure break training, e.g. if the task actually needs several cells
+# co-active for some registers) before any further (e.g. representational
+# analysis) sweeps are built on top of this.
+#
+# competition_reg_coef values: a sparse 3-point bracket spanning negligible
+# to dominant effect, chosen relative to the entropy term's own range
+# (bounded in [0, log(num_lstm_cells)] = [0, log(6)] ~= [0, 1.79], i.e. a
+# SIMILAR order of magnitude to the task's own early cross-entropy loss --
+# unlike weight_decay, which multiplies a potentially large sum of squared
+# weights and so needed much smaller coefficients):
+#   - 0.0:  baseline (no regularization) -- must reproduce the existing
+#           cells=6/creg=6 numbers exactly, as a sanity check.
+#   - 0.1:  a mild, order-of-magnitude-below-loss-scale nudge.
+#   - 1.0:  comparable in magnitude to early-training task loss -- a strong,
+#           possibly-task-damaging pressure, useful for seeing where
+#           accuracy starts to degrade.
+# 2 n_layers x 3 coef values = 6 combinations x 15 seeds = 90 runs -- kept
+# deliberately small (same scale as the weight_decay due-diligence sweep),
+# since this is a first check, not a full sweep -- more/different coef
+# values before further sweeps are built on top of this.
+#
+#   swim --wandb.create_sweep --wandb.from_config configs/lstm_multicell_sweep/lstm_multicell_hparam_sweep_cells6_creg6_competition_reg.yaml
+#
+# See configs/sample_conditional_config.yaml for the independent_variables /
+# conditional_variables mechanics.
+
+independent_variables:
+  ################################################################
+  # dataset / task knobs -- fixed at the one diagnosed operating point
+  ################################################################
+  - dataset.td_prob: [0]  # 0 = ref-back (SIR), matching the staggered sweep.
+
+  - dataset.role_n_congruence: [0]
+
+  - dataset.n_back: [6]  # not meaningful at td_prob=0, kept paired with
+    dataset.concurrent_reg: [6]  # concurrent_reg for structural consistency.
+
+  - dataset.dirichlet_priors: [True]
+
+  ################################################################
+  # model: fixed at num_lstm_cells=6, d_hidden=200 (the "fixed-width" value
+  # at this cell count); n_layers and competition_reg_coef (below) are the
+  # two axes actually being swept.
+  ################################################################
+  - model.model_class: ['lstm_multicell']
+
+  - model.num_lstm_cells: [6]
+
+  - model.d_hidden: [200]
+
+  - model.lstm_merge_strategy: ['concatenate']
+
+  - model.from_pretrained: [None]
+
+  - model.n_layers: [1, 2]  # both architectures, as in the weight_decay sweep
+
+  ################################################################
+  # trainer knobs
+  ################################################################
+  - trainer.competition_reg_coef: [0.0, 0.1, 1.0]
+    # sparse bracket spanning negligible -> dominant effect -- see module
+    # comment for why these values (not weight_decay-scale) make sense here.
+
+  - trainer.logging_steps_per_epoch: [10]
+  - trainer.epochs: [15]
+
+  - trainer.save_strategy: ['best']
+
+  # note: `model.seed` (15 seeds, 42-56) is swept automatically by the CLI for
+  # `--wandb.method grid` and does not need to be listed here -- see
+  # `fixed_experimental_params` in src/workingmem/cli.py.
+
+#### conditional variables
+conditional_variables:
+  # each n_layers value gets its own already-tuned learning_rate (matching
+  # the weight_decay sweep) -- most-specific-first, no default needed since
+  # both n_layers values are covered explicitly.
+  - index:
+      model.n_layers: 1
+    kwargs:
+      trainer.learning_rate: 1e-3
+  - index:
+      model.n_layers: 2
+    kwargs:
+      trainer.learning_rate: 0.0021
