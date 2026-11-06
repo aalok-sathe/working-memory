@@ -1,0 +1,94 @@
+# Mirrors (on this branch, feature-multicell-competition-reg) the main
+# repo's `experiments/lstm_multicell_sweep/lstm_multicell_stress_test_staggered.yaml`
+# -- the full 1-layer staggered stress test: pushes num_lstm_cells across a
+# staggered range of values (1, 2, 4, 6, 8, 10) to see how the multicell
+# mechanism holds up at a much larger cell count, while keeping the same
+# "fixed-width" pattern -- total representational width
+# (num_lstm_cells * d_hidden) held constant across the sweep, and d_hidden
+# kept an exact integer at every cell count. Also crosses concurrent_reg/
+# n_back over [2,4,6,8] instead of a single value.
+#
+# `model.n_layers: 1` (via conditional_variables below), matching the main
+# repo's base (non-"_2layer") staggered config exactly -- this is the
+# baseline this branch's `trainer.competition_reg_coef` regularizer (see
+# src/workingmem/model/interface.py's `compute_cell_competition_loss`) gets
+# checked against across the FULL staggered grid, not just the single
+# cells=6/creg=6 operating point used by
+# configs/lstm_multicell_sweep/lstm_multicell_hparam_sweep_cells6_creg6_competition_reg.yaml.
+#
+# `trainer.competition_reg_coef` is fixed at 1.0 (not swept as its own axis,
+# so this stays at 24 combinations, not 24 x N) -- the single most
+# consequential value from the cells=6/creg=6 check
+# (configs/lstm_multicell_sweep/lstm_multicell_hparam_sweep_cells6_creg6_competition_reg.yaml):
+# it produced the tightest accuracy distribution and zero outlier/failed
+# seeds there (vs. 2/15 failed seeds at coef=0.0), so this checks whether
+# that effect holds across the full staggered grid, not just that one
+# operating point. A plain (coef=0.0) baseline run of this exact grid isn't
+# included here -- compare against the historical staggered-sweep numbers in
+# the main repo's `lstm_multicell_stress_test_staggered.yaml_experiments`
+# instead, which already covers every (num_lstm_cells, concurrent_reg) cell
+# at coef=0.0 (an un-regularized 1-layer model, since this code didn't exist
+# when those were generated).
+#
+#   swim --wandb.create_sweep --wandb.from_config experiments/lstm_multicell_sweep/lstm_multicell_stress_test_staggered.yaml
+#
+# See configs/sample_conditional_config.yaml for the independent_variables /
+# conditional_variables mechanics.
+
+independent_variables:
+  ################################################################
+  # dataset / task knobs
+  ################################################################
+  - dataset.td_prob: [0]  # 0 = ref-back (SIR), 1 = n-back.
+
+  - dataset.role_n_congruence: [0]
+
+  - dataset.n_back: [2,4,6,8]  # only meaningful when td_prob=1; co-varies with concurrent_reg
+    dataset.concurrent_reg: [2,4,6,8]
+
+  - dataset.dirichlet_priors: [True]
+
+  ################################################################
+  # model: multicell-specific knobs -- the stress-tested axis
+  ################################################################
+  - model.model_class: ['lstm_multicell']
+
+  - model.num_lstm_cells: [1,    2,   4,   6,   8,   10 ]
+    model.d_hidden:       [1200, 600, 300, 200, 150, 120]
+    # total width = 1200, evenly divisible by every value in num_lstm_cells (all
+    # even, 2-10, plus 1), so d_hidden stays an exact integer throughout: 1200
+    # (1 cell) down to 120 (10 cells).
+
+  - model.lstm_merge_strategy: ['concatenate']
+
+  - model.from_pretrained: [None]
+
+  ################################################################
+  # trainer knobs
+  ################################################################
+  - trainer.competition_reg_coef: [1.0]
+    # single fixed value, not swept -- see module comment above for why 1.0.
+
+  - trainer.logging_steps_per_epoch: [10]
+  - trainer.epochs: [15]
+
+  # note: `model.seed` (15 seeds, 42-56) is swept automatically by the CLI for
+  # `--wandb.method grid` and does not need to be listed here -- see
+  # `fixed_experimental_params` in src/workingmem/cli.py.
+
+#### conditional variables
+conditional_variables:
+  # ref-back (td_prob=0)
+  - index:
+      model.model_class: 'lstm_multicell'
+      dataset.td_prob: 0
+    kwargs:
+      trainer.learning_rate: 1e-3
+      model.n_layers: 1
+  # n-back (td_prob=1)
+  - index:
+      model.model_class: 'lstm_multicell'
+      dataset.td_prob: 1
+    kwargs:
+      trainer.learning_rate: 3.5e-4
+      model.n_layers: 1
