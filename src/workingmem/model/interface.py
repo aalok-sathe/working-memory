@@ -90,6 +90,23 @@ class TrainingConfig:
     weight_decay: float = 0.0
     sparsity: float = 0.0
 
+    # how gate gradients are computed for `lstm_multicell` models (ignored by all
+    # other architectures). "backprop" (default) is the exact chain-rule gradient,
+    # unchanged from before this option existed. "eligibility" substitutes the
+    # `i`/`f`/`o` gate gradients with `eligibility_trace * discounted_future_reward`
+    # (see `workingmem.model.eligibility.EligibilityRecorder`), mimicking the
+    # scalar-reward-credited (no local derivative) learning signal used by PBWM/
+    # actor-critic gating models, instead of an exact local gradient.
+    credit_assignment_mode: typing.Literal["backprop", "eligibility"] = "backprop"
+    # decay (gamma*lambda) for both the eligibility trace and the discounted
+    # future-reward sum; only used when credit_assignment_mode="eligibility"
+    credit_assignment_decay: float = 0.9
+    # multiplier on the substituted gate gradients; only used when
+    # credit_assignment_mode="eligibility" -- eligibility*reward has no natural
+    # relationship to ordinary backprop gradient magnitudes, so this is a knob to
+    # tune the effective step size independent of `learning_rate`
+    credit_assignment_scale: float = 1.0
+
     # this is where checkpoints are saved, if supplied.
     # if available, a wandb.run.sweep_id AND a model random seed will be appended
     # to the checkpoint directory name.
@@ -286,5 +303,10 @@ def compute_masked_loss(
                 gathered_logits, dim=-1
             ).argmax(-1),
             gathered_labels=gathered_labels,
+            # the sparsity mask applied above (1 = kept, 0 = dropped by
+            # `sparsity`), shape (b, num_answer_positions) -- exposed so callers
+            # (e.g. `credit_assignment_mode="eligibility"`'s reward computation)
+            # can respect the same feedback-frequency manipulation as the loss.
+            sparsity_mask=sparsity_mask,
         )
     return loss
