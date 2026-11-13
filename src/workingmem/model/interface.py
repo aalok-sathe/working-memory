@@ -90,6 +90,16 @@ class TrainingConfig:
     weight_decay: float = 0.0
     sparsity: float = 0.0
 
+    # strength of an auxiliary "cell competition" regularization loss term,
+    # added on top of the task cross-entropy loss: coef * mean_over_tokens(
+    # entropy(softmax(per-cell hidden-state norms)) ). Encourages a small
+    # number of cells to dominate at each timestep (soft winner-take-all /
+    # global inhibition among cells), rather than all cells being equally
+    # active. Currently only implemented for `LSTMMultiCellWrapper`
+    # (see `compute_regularization_loss`); a no-op (0.0) everywhere else,
+    # including the default here, so existing experiments are unaffected.
+    competition_reg_coef: float = 0.0
+
     # this is where checkpoints are saved, if supplied.
     # if available, a wandb.run.sweep_id AND a model random seed will be appended
     # to the checkpoint directory name.
@@ -288,3 +298,38 @@ def compute_masked_loss(
             gathered_labels=gathered_labels,
         )
     return loss
+
+
+def compute_cell_competition_loss(percell_hidden_states: torch.Tensor) -> torch.Tensor:
+    """
+    Soft winner-take-all / global-inhibition regularization loss for a
+    multi-cell recurrent architecture (currently `LSTMMultiCell`): encourages
+    a small number of cells to dominate activity at each timestep, instead of
+    all cells being equally active.
+
+    Given each cell's own (unmerged) hidden state at every timestep, this:
+    1. reduces each cell's `d_hidden`-dim vector to a scalar activation norm
+    2. softmaxes those norms ACROSS CELLS ONLY (independently per batch
+       element and timestep) into a "which cell currently dominates"
+       distribution
+    3. returns the mean entropy of that distribution
+
+    Entropy is maximal (log(num_cells)) when all cells have equal norm (no
+    competition) and minimal (0) when one cell's norm completely dominates
+    (a clean winner) -- so ADDING `coef * this` to the loss and minimizing
+    pushes the model towards winner-take-all dynamics. With `num_cells == 1`
+    this is identically 0 (no competition is possible among a single cell),
+    which is the correct/expected no-op for that case.
+
+    Parameters
+    ----------
+    - `percell_hidden_states`: shape (batch, seq_len, num_cells, d_hidden) --
+        e.g. `LSTMMultiCellWrapper`'s `percell_h` from a `return_percell_states=True`
+        forward pass. Averaged over every token position (not just answer
+        locations) and every batch element, since competition dynamics are
+        assumed to matter throughout processing, not just at readout.
+    """
+    cell_norms = percell_hidden_states.norm(p=2, dim=-1)  # (batch, seq_len, num_cells)
+    cell_participation = torch.nn.functional.softmax(cell_norms, dim=-1)
+    entropy = -(cell_participation * torch.log(cell_participation + 1e-12)).sum(dim=-1)
+    return entropy.mean()
